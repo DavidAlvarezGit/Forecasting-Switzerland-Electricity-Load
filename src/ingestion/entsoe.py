@@ -1,10 +1,28 @@
-import requests
-import pandas as pd
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-import json
-import time
-from settings import Settings
+
+import pandas as pd
+import requests
+
+if __package__ in (None, ""):
+    from settings import Settings
+    from state_utils import (
+        get_state_timestamp,
+        load_json_state,
+        save_json_state,
+        set_state_timestamp,
+    )
+else:
+    from .settings import Settings
+    from .state_utils import (
+        get_state_timestamp,
+        load_json_state,
+        save_json_state,
+        set_state_timestamp,
+    )
+
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -12,34 +30,28 @@ from settings import Settings
 BASE_URL = "https://web-api.tp.entsoe.eu/api"
 SWISS_DOMAIN = "10YCH-SWISSGRIDZ"
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
-STATE_FILE = Path(__file__).resolve().parents[1] / "data" / "state" / "entsoe_state.json"
+DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw" / "entsoe"
+STATE_FILE = Path(__file__).resolve().parents[2] / "data" / "state" / "entsoe_state.json"
 
 
 # =========================================================
 # STATE MANAGEMENT
 # =========================================================
 
-def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    return json.loads(STATE_FILE.read_text())
+def load_state() -> dict[str, str]:
+    return load_json_state(STATE_FILE)
 
 
-def save_state(state: dict):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_state(state: dict[str, str]):
+    save_json_state(STATE_FILE, state)
 
 
-def get_last_timestamp_from_state(state: dict, year: int):
-    ts = state.get(str(year))
-    if ts:
-        return pd.Timestamp(ts, tz="UTC")
-    return None
+def get_last_timestamp_from_state(state: dict[str, str], year: int):
+    return get_state_timestamp(state, str(year))
 
 
-def update_state(state: dict, year: int, timestamp: pd.Timestamp):
-    state[str(year)] = timestamp.isoformat()
+def update_state(state: dict[str, str], year: int, timestamp: pd.Timestamp):
+    set_state_timestamp(state, str(year), timestamp)
     save_state(state)
 
 
@@ -70,12 +82,12 @@ def fetch_with_retries(params, retries=5):
             response.raise_for_status()
             return response.text
 
-        except Exception as e:
+        except Exception as exc:
             if attempt == retries - 1:
                 raise
 
             sleep_time = 2 ** attempt
-            print(f"[Retry {attempt+1}] error: {e} → sleeping {sleep_time}s")
+            print(f"[Retry {attempt+1}] error: {exc} -> sleeping {sleep_time}s")
             time.sleep(sleep_time)
 
 
@@ -112,10 +124,12 @@ def parse_xml(xml_text: str) -> pd.DataFrame:
                 except Exception:
                     continue
 
-                rows.append({
-                    "timestamp_utc": ts,
-                    "load_mw": load,
-                })
+                rows.append(
+                    {
+                        "timestamp_utc": ts,
+                        "load_mw": load,
+                    }
+                )
 
     return pd.DataFrame(rows)
 
@@ -148,11 +162,7 @@ def load_full_dataset() -> pd.DataFrame:
         return pd.DataFrame()
 
     dfs = [pd.read_parquet(f) for f in files]
-    return (
-        pd.concat(dfs)
-        .sort_values("timestamp_utc")
-        .reset_index(drop=True)
-    )
+    return pd.concat(dfs).sort_values("timestamp_utc").reset_index(drop=True)
 
 
 # =========================================================
@@ -164,15 +174,12 @@ def ingest_entsoe(
     start_year: int,
     end_year: int,
 ) -> pd.DataFrame:
-
     state = load_state()
 
     for year in range(start_year, end_year + 1):
-
         print(f"\n[Year {year}]")
 
         last_ts = get_last_timestamp_from_state(state, year)
-
         start = get_start_period(year, last_ts)
         end = get_end_period(year)
 
@@ -193,28 +200,22 @@ def ingest_entsoe(
             continue
 
         existing = load_existing_year(year)
-
         if existing is not None:
             df = pd.concat([existing, df])
 
-        df = (
-            df.drop_duplicates(subset="timestamp_utc")
-            .sort_values("timestamp_utc")
-            .reset_index(drop=True)
-        )
+        df = df.drop_duplicates(subset="timestamp_utc").sort_values("timestamp_utc").reset_index(drop=True)
 
         save_year(df, year)
-
         update_state(state, year, df["timestamp_utc"].max())
 
     return load_full_dataset()
 
 
-
-settings = Settings()
-
-ingest_entsoe(
-	api_key=settings.entsoe_api_key,
-	start_year=2026,
-	end_year=2026,
-)
+if __name__ == "__main__":
+    settings = Settings()
+    result_df = ingest_entsoe(
+        api_key=settings.entsoe_api_key,
+        start_year=2020,
+        end_year=2026,
+    )
+    print("entsoe shape:", result_df.shape)
