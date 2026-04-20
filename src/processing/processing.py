@@ -9,8 +9,10 @@ if str(SRC_ROOT) not in sys.path:
 
 if __package__ in (None, ""):
     from helpers import run_processing_pipeline
+    from features import run_feature_pipeline
 else:
     from .helpers import run_processing_pipeline
+    from .features import run_feature_pipeline
 
 
 def main() -> None:
@@ -21,6 +23,14 @@ def main() -> None:
     print(f"Date range: {meta['start']} -> {meta['end']} | rows={meta['rows']}")
     print(f"Output: {meta['output_path']}")
     print(df.head(5))
+
+    feature_df, feature_meta = run_feature_pipeline(input_path=str(meta["output_path"]))
+    print(
+        f"Feature dataset: {feature_meta['start']} -> {feature_meta['end']} | "
+        f"rows={feature_meta['rows']} cols={feature_meta['columns']}"
+    )
+    print(f"Feature output: {feature_meta['output_path']}")
+    print(feature_df.head(5))
 
 
 if __name__ == "__main__":
