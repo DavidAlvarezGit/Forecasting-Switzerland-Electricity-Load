@@ -1,16 +1,17 @@
-from typing import List
+
+from typing import Callable
 
 
 class ValidationError(Exception):
     pass
 
 
-def collect_checks(checks: List):
+def collect_checks(checks: list[Callable[[], None]]) -> None:
     """
     Run a list of callables and collect all AssertionErrors.
     Raises a single ValidationError with all messages.
     """
-    errors = []
+    errors: list[str] = []
 
     for check in checks:
         try:
