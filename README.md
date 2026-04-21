@@ -55,6 +55,37 @@ The workflow is organized into four stages:
 - default model artifact path: [data/processed/models/best_lstm_24h.pt](data/processed/models)
 - default feature table path: [data/processed/lstm_features.parquet](data/processed/lstm_features.parquet)
 
+### End-to-End Pipeline Diagram
+
+```mermaid
+flowchart LR
+	A[ENTSO-E API\nLoad Data] --> B[src/ingestion/entsoe.py]
+	C[Open-Meteo APIs\nHistorical + Forecast Weather] --> D[src/ingestion/openmeteo.py]
+
+	B --> E[data/raw/entsoe/*.parquet]
+	D --> F[data/raw/weather_*/year=*.parquet]
+	B --> G[data/state/entsoe_state.json]
+	D --> H[data/state/openmeteo_state.json]
+
+	E --> I[src/processing/processing.py]
+	F --> I
+	I --> J[src/processing/helpers.py\naggregate_to_interim]
+	J --> K[data/interim/aggregated.parquet]
+
+	K --> L[src/processing/features.py]
+	L --> M[data/processed/lstm_features.parquet]
+
+	M --> N[src/modeling/train_lstm.py]
+	N --> O[src/modeling/lstm_pipeline.py]
+	O --> P[data/processed/models/best_lstm_24h.pt]
+
+	M --> Q[src/modeling/inference.py]
+	P --> Q
+	Q --> R[Point Forecast + Prediction Intervals + Backtest Metrics]
+
+	R --> S[app/streamlit_app.py\nDashboard]
+```
+
 ## 4. Current Outputs
 
 The repository currently provides:
