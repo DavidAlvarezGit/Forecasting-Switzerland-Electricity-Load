@@ -1,6 +1,6 @@
 # Switzerland Electricity Load Forecasting
 
-This repository builds and serves a production-oriented forecasting workflow for Swiss electricity load using ENTSO-E load data and Open-Meteo weather features.
+This repository builds and serves a forecasting workflow for Swiss electricity load using ENTSO-E load data and Open-Meteo weather features.
 
 ## 1. Project Overview
 
@@ -8,7 +8,7 @@ The project predicts short-term electricity demand with an LSTM-based model and 
 
 Why this project matters:
 
-- electricity demand forecasting is time-sensitive and error-sensitive
+- electricity demand forecasting is a difficult task that matters for many companies
 - weather and seasonality strongly affect load, so feature engineering and robust ingestion are essential
 - a usable app should show both forecasts and uncertainty, not only point estimates
 
@@ -16,7 +16,7 @@ Current capabilities include:
 
 - incremental ingestion from ENTSO-E and Open-Meteo
 - preprocessing and feature generation for sequence modeling
-- LSTM training and artifact export
+- LSTM training
 - inference with optional prediction intervals and backtest diagnostics
 - Streamlit app for operational visualization
 
@@ -28,7 +28,7 @@ This repository addresses that by:
 
 - consolidating multi-source hourly data into aligned datasets
 - engineering lag, rolling, and cyclical features
-- training a sequence model for multi-step forecasting
+- training a sequence model for multi-step forecasting (LSTM)
 - evaluating against a naive baseline and interval coverage
 
 ## 3. Technical Approach
@@ -38,7 +38,7 @@ The workflow is organized into four stages:
 1. Ingestion
 - ENTSO-E load ingestion in [src/ingestion/entsoe.py](src/ingestion/entsoe.py)
 - Open-Meteo historical, historical-forecast, and live forecast ingestion in [src/ingestion/openmeteo.py](src/ingestion/openmeteo.py)
-- stateful incremental updates via JSON state files in [data/state](data/state)
+- incremental updates via JSON state files in [data/state](data/state)
 
 2. Processing and Feature Engineering
 - raw-to-interim aggregation in [src/processing/helpers.py](src/processing/helpers.py)
@@ -52,53 +52,23 @@ The workflow is organized into four stages:
 
 4. App
 - Streamlit dashboard in [app/streamlit_app.py](app/streamlit_app.py)
-- default model artifact path: [data/processed/models/best_lstm_24h.pt](data/processed/models)
+- default model path: [data/processed/models/best_lstm_24h.pt](data/processed/models)
 - default feature table path: [data/processed/lstm_features.parquet](data/processed/lstm_features.parquet)
 
-### End-to-End Pipeline Diagram
 
-```mermaid
-flowchart LR
-	A[ENTSO-E API\nLoad Data] --> B[src/ingestion/entsoe.py]
-	C[Open-Meteo APIs\nHistorical + Forecast Weather] --> D[src/ingestion/openmeteo.py]
-
-	B --> E[data/raw/entsoe/*.parquet]
-	D --> F[data/raw/weather_*/year=*.parquet]
-	B --> G[data/state/entsoe_state.json]
-	D --> H[data/state/openmeteo_state.json]
-
-	E --> I[src/processing/processing.py]
-	F --> I
-	I --> J[src/processing/helpers.py\naggregate_to_interim]
-	J --> K[data/interim/aggregated.parquet]
-
-	K --> L[src/processing/features.py]
-	L --> M[data/processed/lstm_features.parquet]
-
-	M --> N[src/modeling/train_lstm.py]
-	N --> O[src/modeling/lstm_pipeline.py]
-	O --> P[data/processed/models/best_lstm_24h.pt]
-
-	M --> Q[src/modeling/inference.py]
-	P --> Q
-	Q --> R[Point Forecast + Prediction Intervals + Backtest Metrics]
-
-	R --> S[app/streamlit_app.py\nDashboard]
-```
 
 ## 4. Current Outputs
 
 The repository currently provides:
 
 - processed feature datasets under [data/processed](data/processed)
-- model checkpoints and selected model artifacts under [data/processed/models](data/processed/models)
+- model checkpoints and selected model information under [data/processed/models](data/processed/models)
 - an interactive dashboard with:
 	- point forecasts
-	- optional prediction intervals
-	- recent historical forecast overlay
-	- model vs naive baseline metrics when backtest is available
+	- prediction intervals that are created using Adaptive Conformal Inference (ACI)
+	- recent historical forecasts
+	- model vs naive baseline metrics
 
-This README intentionally avoids hardcoded benchmark claims because results can change with ingestion refreshes, feature updates, and retraining.
 
 ## 5. How to Run
 
@@ -192,7 +162,5 @@ load_forecasting/
 ## 7. Future Improvements
 
 - add automated retraining and model selection schedules
-- add a lightweight model fallback for very low-resource environments
-- extend error analysis by season, holiday periods, and abrupt weather shifts
-- add CI checks for data contracts and model artifact compatibility
-- add deployment monitoring for latency, coverage drift, and forecast bias
+- add monitoring of the model over time
+- add automated fetching of API data
