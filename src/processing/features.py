@@ -7,20 +7,25 @@ import numpy as np
 import pandas as pd
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-
-from .helpers import find_project_root
+if __package__ in (None, ""):
+    from helpers import find_project_root
+else:
+    from .helpers import find_project_root
 
 
 TARGET_COL = "load_load_mw"
 AGGREGATED_DATASET_REL_PATH = Path("data") / "interim" / "aggregated.parquet"
-FEATURE_DATASET_REL_PATH = Path("data") / "processed" / "features.parquet"
+LSTM_FEATURE_DATASET_REL_PATH = Path("data") / "processed" / "lstm_features.parquet"
 
 
 def _as_datetime_index(df: pd.DataFrame) -> pd.DatetimeIndex:
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame index must be a DatetimeIndex")
     return df.index
+
 
 def _load_aggregated(project_root: Path, input_path: str | Path | None = None) -> pd.DataFrame:
     resolved_input = Path(input_path) if input_path is not None else project_root / AGGREGATED_DATASET_REL_PATH
@@ -76,16 +81,17 @@ def _add_load_rolling_features(df: pd.DataFrame, target_col: str, windows: list[
     return out
 
 
-def build_feature_table(
+def build_lstm_feature_table(
     aggregated_df: pd.DataFrame,
     target_col: str = TARGET_COL,
     lags: list[int] | None = None,
     rolling_windows: list[int] | None = None,
+    keep_raw_calendar: bool = False,
 ) -> pd.DataFrame:
     if target_col not in aggregated_df.columns:
         raise ValueError(f"Target column not found in aggregated data: {target_col}")
 
-    lag_values = lags or [1, 2, 3, 4, 5, 6, 7, 12, 24, 36, 48, 72, 100, 150, 168]
+    lag_values = lags or [1, 2, 3, 6, 12, 24, 48, 72, 168]
     window_values = rolling_windows or [24, 168]
 
     features = aggregated_df.copy()
@@ -93,6 +99,10 @@ def build_feature_table(
     features = _add_cyclical_features(features)
     features = _add_load_lag_features(features, target_col=target_col, lags=lag_values)
     features = _add_load_rolling_features(features, target_col=target_col, windows=window_values)
+
+    if not keep_raw_calendar:
+        # Cyclical calendar features are enough for sequence models and reduce redundancy.
+        features = features.drop(columns=["hour", "dayofweek", "month", "dayofyear"], errors="ignore")
 
     features = features.dropna().sort_index()
     return features
@@ -105,26 +115,32 @@ def run_feature_pipeline(
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
     project_root = find_project_root(Path.cwd().resolve())
     aggregated_df = _load_aggregated(project_root, input_path)
-    feature_df = build_feature_table(aggregated_df, target_col=target_col)
+    lstm_df = build_lstm_feature_table(aggregated_df, target_col=target_col)
 
-    resolved_output = Path(output_path) if output_path is not None else project_root / FEATURE_DATASET_REL_PATH
+    resolved_output = (
+        Path(output_path)
+        if output_path is not None
+        else project_root / LSTM_FEATURE_DATASET_REL_PATH
+    )
+
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
-    feature_df.to_parquet(resolved_output)
+    lstm_df.to_parquet(resolved_output)
 
     meta: dict[str, int | str] = {
-        "rows": int(len(feature_df)),
-        "columns": int(feature_df.shape[1]),
-        "start": str(feature_df.index.min()),
-        "end": str(feature_df.index.max()),
+        "model": "lstm",
+        "rows": int(len(lstm_df)),
+        "columns": int(lstm_df.shape[1]),
+        "start": str(lstm_df.index.min()),
+        "end": str(lstm_df.index.max()),
         "output_path": str(resolved_output),
     }
-    return feature_df, meta
+    return lstm_df, meta
 
 
 def main() -> None:
     feature_df, meta = run_feature_pipeline()
     print(
-        f"Feature dataset: {meta['start']} -> {meta['end']} | "
+        f"LSTM feature dataset: {meta['start']} -> {meta['end']} | "
         f"rows={meta['rows']} cols={meta['columns']}"
     )
     print(f"Feature output: {meta['output_path']}")

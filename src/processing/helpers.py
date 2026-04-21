@@ -1,7 +1,12 @@
+import sys
 from pathlib import Path
 from typing import Mapping
 
 import pandas as pd
+
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from validation.core import collect_checks
 from validation import data_checks as dc
