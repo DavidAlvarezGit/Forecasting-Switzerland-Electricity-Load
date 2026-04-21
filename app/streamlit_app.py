@@ -59,21 +59,31 @@ def main() -> None:
             "Calibration windows",
             min_value=24,
             max_value=1000,
-            value=96,
+            value=168,
             step=24,
         )
         eval_windows = st.number_input(
             "Backtest windows",
             min_value=24,
             max_value=1000,
-            value=120,
+            value=1000,
+            step=50,
+        )
+        past_points = st.number_input(
+            "Past points in first plot",
+            min_value=24,
+            max_value=2000,
+            value=336,
+            step=24,
+        )
+        history_points = st.number_input(
+            "Forecast history points",
+            min_value=24,
+            max_value=100000,
+            value=5000,
             step=24,
         )
         per_horizon = st.checkbox("Per-horizon interval width", value=True)
-
-    # Keep a simple dashboard: historical and context windows use fixed defaults.
-    past_points = 336
-    history_points = 5000
 
     if not Path(model_path).exists():
         st.warning("Model data not found. Train and save a model first.")
@@ -93,13 +103,6 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Failed to load features: {exc}")
         st.stop()
-
-    needed_cols = [c for c in artifact.feature_cols if c in df.columns]
-    if artifact.target_col in df.columns:
-        needed_cols.append(artifact.target_col)
-    if needed_cols:
-        # Trim the working dataframe to the columns required for inference/backtest.
-        df = df.loc[:, pd.Index(needed_cols).unique()]
 
     st.write(f"Feature table rows: {len(df)} | columns: {df.shape[1]}")
 
@@ -121,8 +124,6 @@ def main() -> None:
                 calibration_windows=int(calibration_windows),
                 eval_windows=int(eval_windows),
                 per_horizon=per_horizon,
-                include_history=True,
-                history_windows=int(history_points),
             )
         except Exception as exc:
             st.warning(
