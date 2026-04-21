@@ -283,6 +283,8 @@ def evaluate_recent_backtest(
     eval_windows: int = 120,
     batch_size: int = 64,
     per_horizon: bool = True,
+    include_history: bool = False,
+    history_windows: int = 240,
 ) -> dict[str, Any]:
     if not (0 < float(alpha) < 1):
         raise ValueError("alpha must be in (0, 1).")
@@ -290,6 +292,8 @@ def evaluate_recent_backtest(
         raise ValueError("calibration_windows must be >= 1.")
     if eval_windows < 1:
         raise ValueError("eval_windows must be >= 1.")
+    if history_windows < 1:
+        raise ValueError("history_windows must be >= 1.")
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("Input dataframe must have a DatetimeIndex.")
 
@@ -376,48 +380,63 @@ def evaluate_recent_backtest(
         coverage = float(np.mean(in_interval))
         mean_interval_width = float(np.mean(upper_eval - lower_eval))
 
-    x_history = np.stack([x_all[i - artifact.lookback : i] for i in anchors], axis=0)
-    y_history_true = np.stack([y_all[i : i + artifact.horizon] for i in anchors], axis=0)
-    x_history_scaled = (x_history - artifact.x_mean) / artifact.x_scale
-    y_history_pred_scaled = _predict_scaled_batch(
-        model=artifact.model,
-        x_batch=x_history_scaled,
-        device=artifact.device,
-        batch_size=batch_size,
-    )
-    y_history_pred = y_history_pred_scaled * artifact.y_scale + artifact.y_mean
-    y_history_baseline = np.stack(
-        [np.full(artifact.horizon, y_all[i - 1], dtype=np.float32) for i in anchors],
-        axis=0,
-    )
-
-    history_records: list[dict[str, Any]] = []
-    history_index: list[pd.Timestamp] = []
-    for row_idx, anchor in enumerate(anchors):
-        horizon_index = df_sorted.index[int(anchor) : int(anchor) + artifact.horizon]
-        pred_row = y_history_pred[row_idx]
-        true_row = y_history_true[row_idx]
-        baseline_row = y_history_baseline[row_idx]
-
-        for step_idx, ts in enumerate(horizon_index):
-            history_records.append(
-                {
-                    "true_load_mw": float(true_row[step_idx]),
-                    "forecast_load_mw": float(pred_row[step_idx]),
-                    "naive_baseline_load_mw": float(baseline_row[step_idx]),
-                    "lower_pi": float(pred_row[step_idx] - q_hat[step_idx]) if n_cal > 0 else np.nan,
-                    "upper_pi": float(pred_row[step_idx] + q_hat[step_idx]) if n_cal > 0 else np.nan,
-                    "anchor_timestamp": df_sorted.index[int(anchor)],
-                }
-            )
-            history_index.append(ts)
-
-    history_df = pd.DataFrame(history_records, index=pd.DatetimeIndex(history_index))
-    history_df = history_df.sort_index()
-
     latest_anchor = int(anchors_eval[-1])
+    latest_row = eval_count - 1
     latest_index = df_sorted.index[latest_anchor : latest_anchor + artifact.horizon]
-    latest_df = history_df.loc[latest_index].copy()
+    latest_df = pd.DataFrame(
+        {
+            "true_load_mw": y_eval_true[latest_row],
+            "forecast_load_mw": y_eval_pred[latest_row],
+            "naive_baseline_load_mw": y_eval_baseline[latest_row],
+        },
+        index=latest_index,
+    )
+    if n_cal > 0:
+        latest_df["lower_pi"] = latest_df["forecast_load_mw"] - q_hat
+        latest_df["upper_pi"] = latest_df["forecast_load_mw"] + q_hat
+
+    history_df: pd.DataFrame | None = None
+    if include_history:
+        history_anchor_count = int(min(history_windows, anchors.size))
+        anchors_history = anchors[-history_anchor_count:]
+        x_history = np.stack([x_all[i - artifact.lookback : i] for i in anchors_history], axis=0)
+        y_history_true = np.stack([y_all[i : i + artifact.horizon] for i in anchors_history], axis=0)
+        x_history_scaled = (x_history - artifact.x_mean) / artifact.x_scale
+        y_history_pred_scaled = _predict_scaled_batch(
+            model=artifact.model,
+            x_batch=x_history_scaled,
+            device=artifact.device,
+            batch_size=batch_size,
+        )
+        y_history_pred = y_history_pred_scaled * artifact.y_scale + artifact.y_mean
+        y_history_baseline = np.stack(
+            [np.full(artifact.horizon, y_all[i - 1], dtype=np.float32) for i in anchors_history],
+            axis=0,
+        )
+
+        history_records: list[dict[str, Any]] = []
+        history_index: list[pd.Timestamp] = []
+        for row_idx, anchor in enumerate(anchors_history):
+            horizon_index = df_sorted.index[int(anchor) : int(anchor) + artifact.horizon]
+            pred_row = y_history_pred[row_idx]
+            true_row = y_history_true[row_idx]
+            baseline_row = y_history_baseline[row_idx]
+
+            for step_idx, ts in enumerate(horizon_index):
+                history_records.append(
+                    {
+                        "true_load_mw": float(true_row[step_idx]),
+                        "forecast_load_mw": float(pred_row[step_idx]),
+                        "naive_baseline_load_mw": float(baseline_row[step_idx]),
+                        "lower_pi": float(pred_row[step_idx] - q_hat[step_idx]) if n_cal > 0 else np.nan,
+                        "upper_pi": float(pred_row[step_idx] + q_hat[step_idx]) if n_cal > 0 else np.nan,
+                        "anchor_timestamp": df_sorted.index[int(anchor)],
+                    }
+                )
+                history_index.append(ts)
+
+        history_df = pd.DataFrame(history_records, index=pd.DatetimeIndex(history_index))
+        history_df = history_df.sort_index()
 
     return {
         "mae_model": mae_model,

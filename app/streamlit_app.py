@@ -55,19 +55,22 @@ def main() -> None:
         st.header("Intervals")
         show_intervals = st.checkbox("Show prediction intervals", value=True)
         confidence = st.slider("Confidence level", min_value=0.70, max_value=0.99, value=0.90, step=0.01)
+        st.header("Performance")
+        compute_backtest = st.checkbox("Compute backtest metrics", value=False)
+        include_forecast_history = st.checkbox("Include historical forecast line", value=False)
         calibration_windows = st.number_input(
             "Calibration windows",
             min_value=24,
             max_value=1000,
-            value=168,
+            value=96,
             step=24,
         )
         eval_windows = st.number_input(
             "Backtest windows",
             min_value=24,
             max_value=1000,
-            value=1000,
-            step=50,
+            value=120,
+            step=24,
         )
         past_points = st.number_input(
             "Past points in first plot",
@@ -80,7 +83,7 @@ def main() -> None:
             "Forecast history points",
             min_value=24,
             max_value=100000,
-            value=5000,
+            value=336,
             step=24,
         )
         per_horizon = st.checkbox("Per-horizon interval width", value=True)
@@ -104,6 +107,13 @@ def main() -> None:
         st.error(f"Failed to load features: {exc}")
         st.stop()
 
+    needed_cols = [c for c in artifact.feature_cols if c in df.columns]
+    if artifact.target_col in df.columns:
+        needed_cols.append(artifact.target_col)
+    if needed_cols:
+        # Trim the working dataframe to the columns required for inference/backtest.
+        df = df.loc[:, pd.Index(needed_cols).unique()]
+
     st.write(f"Feature table rows: {len(df)} | columns: {df.shape[1]}")
 
     if len(df) < artifact.lookback:
@@ -115,7 +125,7 @@ def main() -> None:
     alpha = 1.0 - float(confidence)
     backtest: dict[str, Any] | None = None
 
-    if evaluate_recent_backtest is not None:
+    if compute_backtest and evaluate_recent_backtest is not None:
         try:
             backtest = evaluate_recent_backtest(
                 df,
@@ -124,6 +134,8 @@ def main() -> None:
                 calibration_windows=int(calibration_windows),
                 eval_windows=int(eval_windows),
                 per_horizon=per_horizon,
+                include_history=include_forecast_history,
+                history_windows=int(history_points),
             )
         except Exception as exc:
             st.warning(
@@ -164,7 +176,10 @@ def main() -> None:
             f"calibration windows={int(backtest['n_calibration_windows'])}."
         )
     else:
-        st.info("Backtest metrics unavailable in this runtime.")
+        if compute_backtest:
+            st.info("Backtest metrics unavailable in this runtime.")
+        else:
+            st.info("Backtest metrics are disabled to reduce CPU and memory usage.")
 
     if show_intervals and forecast_next_horizon_with_intervals is not None:
         try:
@@ -218,7 +233,7 @@ def main() -> None:
             forecast_before = forecast_history_df["forecast_load_mw"].groupby(level=0).last().sort_index()
             if len(forecast_before) > int(history_points):
                 forecast_before = forecast_before.tail(int(history_points))
-        else:
+        elif include_forecast_history:
             latest_window_df = backtest.get("latest_window_df")
             if isinstance(latest_window_df, pd.DataFrame) and "forecast_load_mw" in latest_window_df.columns:
                 forecast_before = latest_window_df["forecast_load_mw"].copy()
