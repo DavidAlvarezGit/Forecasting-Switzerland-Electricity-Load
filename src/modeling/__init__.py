@@ -10,11 +10,16 @@ try:
         save_best_pipeline,
         load_best_pipeline,
     )
-except ModuleNotFoundError:
-    # Keep package importable even when optional LightGBM module is absent.
+except (ModuleNotFoundError, OSError):
+    # Keep package importable even when optional LightGBM / system libraries are absent.
     pass
 
-from .lstm_pipeline import ACI, LSTMTrainConfig, LSTMRegressor, run_training_pipeline
+try:
+    from .lstm_pipeline import ACI, LSTMTrainConfig, LSTMRegressor, run_training_pipeline
+except (ModuleNotFoundError, OSError):
+    # Streamlit inference does not need the training stack at runtime.
+    pass
+
 from .inference import LoadedLSTMArtifact, load_lstm_artifact, forecast_next_horizon
 
 __all__ = [

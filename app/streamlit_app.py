@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -69,6 +68,20 @@ def main() -> None:
             max_value=1000,
             value=1000,
             step=50,
+        )
+        past_points = st.number_input(
+            "Past points in first plot",
+            min_value=24,
+            max_value=2000,
+            value=336,
+            step=24,
+        )
+        history_points = st.number_input(
+            "Forecast history points",
+            min_value=24,
+            max_value=100000,
+            value=5000,
+            step=24,
         )
         per_horizon = st.checkbox("Per-horizon interval width", value=True)
 
@@ -197,11 +210,23 @@ def main() -> None:
     horizon_to_show = st.slider("Steps to display", min_value=1, max_value=artifact.horizon, value=min(24, artifact.horizon))
     forecast_show = forecast.iloc[:horizon_to_show]
     forecast_df_show = forecast_df.iloc[:horizon_to_show].copy()
+    forecast_before = pd.Series(dtype=float)
+    if backtest is not None:
+        forecast_history_df = backtest.get("forecast_history_df")
+        if isinstance(forecast_history_df, pd.DataFrame) and "forecast_load_mw" in forecast_history_df.columns:
+            forecast_history_df = forecast_history_df.sort_index()
+            forecast_before = forecast_history_df["forecast_load_mw"].groupby(level=0).last().sort_index()
+            if len(forecast_before) > int(history_points):
+                forecast_before = forecast_before.tail(int(history_points))
+        else:
+            latest_window_df = backtest.get("latest_window_df")
+            if isinstance(latest_window_df, pd.DataFrame) and "forecast_load_mw" in latest_window_df.columns:
+                forecast_before = latest_window_df["forecast_load_mw"].copy()
 
     context = pd.Series(dtype=float)
     real_load_on_horizon = pd.Series(dtype=float)
     if artifact.target_col in df.columns:
-        context = df[artifact.target_col].dropna().tail(72)
+        context = df[artifact.target_col].dropna().tail(int(past_points))
         real_load_on_horizon = df[artifact.target_col].reindex(forecast_df_show.index)
 
     if real_load_on_horizon.notna().any():
@@ -215,6 +240,7 @@ def main() -> None:
     chart_df = pd.DataFrame(index=chart_index)
     chart_df["actual_recent"] = context.reindex(chart_index)
     chart_df["forecast_load_mw"] = forecast_show.reindex(chart_index)
+    chart_df["forecast_before_mw"] = forecast_before.reindex(chart_index)
     chart_df["real_load_mw"] = real_load_on_horizon.reindex(chart_index)
 
     if has_intervals:
@@ -226,61 +252,6 @@ def main() -> None:
         chart_df["upper_pi"] = forecast_df_show["upper_pi"].reindex(chart_index)
 
     st.line_chart(chart_df)
-
-    if backtest is not None:
-        st.subheader("Latest Realized Horizon: True Targets vs Forecast")
-        latest_window_df = backtest["latest_window_df"]
-        if isinstance(latest_window_df, pd.DataFrame) and not latest_window_df.empty:
-            display_cols = ["true_load_mw", "forecast_load_mw", "naive_baseline_load_mw"]
-            if {"lower_pi", "upper_pi"}.issubset(latest_window_df.columns):
-                display_cols.extend(["lower_pi", "upper_pi"])
-
-            plot_df = latest_window_df[display_cols].reset_index().rename(columns={"index": "timestamp"})
-            chart_layers: list[alt.Chart] = []
-
-            if {"lower_pi", "upper_pi"}.issubset(latest_window_df.columns):
-                interval_band = alt.Chart(plot_df).mark_area(
-                    color="#4C78A8",
-                    opacity=0.18,
-                ).encode(
-                    x=alt.X("timestamp:T", title="Time"),
-                    y=alt.Y("lower_pi:Q", title="Load (MW)"),
-                    y2="upper_pi:Q",
-                )
-                chart_layers.append(interval_band)
-
-            baseline_line = alt.Chart(plot_df).mark_line(
-                color="#8A8A8A",
-                strokeDash=[6, 4],
-                strokeWidth=1.8,
-                opacity=0.8,
-            ).encode(
-                x="timestamp:T",
-                y="naive_baseline_load_mw:Q",
-            )
-            mean_line = alt.Chart(plot_df).mark_line(
-                color="#1F77B4",
-                strokeWidth=2.2,
-                opacity=0.45,
-            ).encode(
-                x="timestamp:T",
-                y="forecast_load_mw:Q",
-            )
-            true_line = alt.Chart(plot_df).mark_line(
-                color="#111111",
-                strokeWidth=2.5,
-                opacity=1.0,
-            ).encode(
-                x="timestamp:T",
-                y="true_load_mw:Q",
-            )
-
-            chart_layers.extend([baseline_line, mean_line, true_line])
-            latest_chart = alt.layer(*chart_layers).interactive()
-            st.altair_chart(latest_chart, use_container_width=True)
-            st.dataframe(latest_window_df[display_cols], use_container_width=True)
-
-    st.dataframe(forecast_df_show, use_container_width=True)
 
 
 if __name__ == "__main__":
