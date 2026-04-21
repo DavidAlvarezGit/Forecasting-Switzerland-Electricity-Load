@@ -101,15 +101,22 @@ def main() -> None:
 
     if evaluate_recent_backtest is not None:
         try:
-            backtest = evaluate_recent_backtest(
-                df,
-                artifact,
-                alpha=alpha,
-                calibration_windows=int(calibration_windows),
-                eval_windows=int(eval_windows),
-                history_windows=int(history_points),
-                per_horizon=per_horizon,
-            )
+            backtest_kwargs = {
+                "alpha": alpha,
+                "calibration_windows": int(calibration_windows),
+                "eval_windows": int(eval_windows),
+                "history_windows": int(history_points),
+                "per_horizon": per_horizon,
+            }
+            try:
+                backtest = evaluate_recent_backtest(df, artifact, **backtest_kwargs)
+            except TypeError as type_exc:
+                # Compatibility fallback when runtime still serves an older module
+                # that does not yet accept `history_windows`.
+                if "history_windows" not in str(type_exc):
+                    raise
+                backtest_kwargs.pop("history_windows", None)
+                backtest = evaluate_recent_backtest(df, artifact, **backtest_kwargs)
         except Exception as exc:
             st.warning(
                 "Backtest metrics could not be computed. "
