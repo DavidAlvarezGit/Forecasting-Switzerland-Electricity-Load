@@ -1,0 +1,7 @@
+# Runtime dependencies for Streamlit deployment
+altair==6.0.0
+numpy>=1.26,<3
+pandas==2.3.3
+pyarrow==23.0.1
+streamlit==1.56.0
+torch
