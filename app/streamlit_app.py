@@ -55,20 +55,6 @@ def main() -> None:
         st.header("Intervals")
         show_intervals = st.checkbox("Show prediction intervals", value=True)
         confidence = st.slider("Confidence level", min_value=0.70, max_value=0.99, value=0.90, step=0.01)
-        calibration_windows = st.number_input(
-            "Calibration windows",
-            min_value=24,
-            max_value=1000,
-            value=168,
-            step=24,
-        )
-        eval_windows = st.number_input(
-            "Backtest windows",
-            min_value=24,
-            max_value=1000,
-            value=1000,
-            step=50,
-        )
         past_points = st.number_input(
             "Past points in first plot",
             min_value=24,
@@ -76,14 +62,12 @@ def main() -> None:
             value=336,
             step=24,
         )
-        history_points = st.number_input(
-            "Forecast history points",
-            min_value=24,
-            max_value=100000,
-            value=5000,
-            step=24,
-        )
         per_horizon = st.checkbox("Per-horizon interval width", value=True)
+
+    # Keep heavy backtest knobs fixed to reduce runtime and memory usage.
+    calibration_windows = 120
+    eval_windows = 120
+    history_points = 336
 
     if not Path(model_path).exists():
         st.warning("Model data not found. Train and save a model first.")
