@@ -54,22 +54,12 @@ HOURLY_VARS = [
     "sunshine_duration",
 ]
 
-DAILY_VARS = [
-    "temperature_2m_mean",
-    "daylight_duration",
-    "temperature_2m_min",
-    "temperature_2m_max",
-    "wind_gusts_10m_mean",
-    "wind_speed_10m_mean",
-]
-
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
 PROCESSED_DIR = DATA_ROOT / "raw"
 STATE_FILE = DATA_ROOT / "state" / "openmeteo_state.json"
 
 DATASET_HISTORICAL = "weather_historical"
 DATASET_HISTORICAL_FORECAST_HOURLY = "weather_historical_forecast_hourly"
-DATASET_HISTORICAL_FORECAST_DAILY = "weather_historical_forecast_daily"
 DATASET_LIVE_FORECAST = "weather_live_forecast"
 
 
@@ -175,14 +165,11 @@ def parse_hourly_responses(responses, hourly_vars: list[str]) -> pd.DataFrame:
 def parse_historical_forecast_responses(
     responses,
     hourly_vars: list[str],
-    daily_vars: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     hourly_rows: list[pd.DataFrame] = []
-    daily_rows: list[pd.DataFrame] = []
 
     for i, response in enumerate(responses):
         hourly = response.Hourly()
-        daily = response.Daily()
 
         hourly_df = pd.DataFrame(
             {
@@ -204,36 +191,12 @@ def parse_historical_forecast_responses(
         for j, col in enumerate(hourly_vars):
             hourly_df[col] = hourly.Variables(j).ValuesAsNumpy()
 
-        daily_df = pd.DataFrame(
-            {
-                "date_utc": pd.date_range(
-                    start=pd.to_datetime(daily.Time(), unit="s", utc=True),
-                    end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
-                    freq=pd.Timedelta(seconds=daily.Interval()),
-                    inclusive="left",
-                ),
-                "city": CITIES[i],
-                "location_id": i,
-                "latitude": response.Latitude(),
-                "longitude": response.Longitude(),
-                "elevation": response.Elevation(),
-                "retrieved_at_utc": pd.Timestamp.utcnow(),
-            }
-        )
-
-        for j, col in enumerate(daily_vars):
-            daily_df[col] = daily.Variables(j).ValuesAsNumpy()
-
         hourly_rows.append(hourly_df)
-        daily_rows.append(daily_df)
 
     if not hourly_rows:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
-    return (
-        pd.concat(hourly_rows, ignore_index=True),
-        pd.concat(daily_rows, ignore_index=True),
-    )
+    return pd.concat(hourly_rows, ignore_index=True)
 
 
 def _dataset_dir(dataset: str) -> Path:
@@ -329,43 +292,33 @@ def ingest_weather_historical_forecast(
     end_date: str,
     model: str = "best_match",
     hourly_vars: list[str] | None = None,
-    daily_vars: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     hourly_to_use = hourly_vars or HOURLY_VARS
-    daily_to_use = daily_vars or DAILY_VARS
 
     state = load_state()
     last_ts = get_last_timestamp(state, DATASET_HISTORICAL_FORECAST_HOURLY)
     date_range = _build_date_range(start_date, end_date, last_ts)
     if date_range is None:
         print("No new historical forecast weather window to fetch")
-        return (
-            load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc"),
-            load_dataset(DATASET_HISTORICAL_FORECAST_DAILY, "date_utc"),
-        )
+        return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
 
     effective_start, effective_end = date_range
 
     params = _build_common_params(hourly_to_use)
-    params["daily"] = daily_to_use
     params["start_date"] = effective_start
     params["end_date"] = effective_end
     params["models"] = model
 
     client = build_client()
     responses = fetch_with_retries(client, OPENMETEO_HISTORICAL_FORECAST_URL, params)
-    hourly_df, daily_df = parse_historical_forecast_responses(
+    hourly_df = parse_historical_forecast_responses(
         responses,
         hourly_vars=hourly_to_use,
-        daily_vars=daily_to_use,
     )
 
     if hourly_df.empty:
         print("No new historical forecast weather data")
-        return (
-            load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc"),
-            load_dataset(DATASET_HISTORICAL_FORECAST_DAILY, "date_utc"),
-        )
+        return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
 
     save_partitioned(
         df=hourly_df,
@@ -373,18 +326,9 @@ def ingest_weather_historical_forecast(
         time_col="timestamp_utc",
         dedupe_cols=["timestamp_utc", "location_id"],
     )
-    save_partitioned(
-        df=daily_df,
-        dataset=DATASET_HISTORICAL_FORECAST_DAILY,
-        time_col="date_utc",
-        dedupe_cols=["date_utc", "location_id"],
-    )
     update_state(state, DATASET_HISTORICAL_FORECAST_HOURLY, hourly_df["timestamp_utc"].max())
 
-    return (
-        load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc"),
-        load_dataset(DATASET_HISTORICAL_FORECAST_DAILY, "date_utc"),
-    )
+    return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
 
 
 def ingest_weather_live_forecast(
@@ -422,12 +366,11 @@ if __name__ == "__main__":
     )
     print("historical shape:", historical_df.shape)
 
-    historical_forecast_hourly_df, historical_forecast_daily_df = ingest_weather_historical_forecast(
+    historical_forecast_hourly_df = ingest_weather_historical_forecast(
         start_date="2020-01-01",
         end_date="2026-04-19",
     )
     print("historical_forecast_hourly shape:", historical_forecast_hourly_df.shape)
-    print("historical_forecast_daily shape:", historical_forecast_daily_df.shape)
 
     live_forecast_df = ingest_weather_live_forecast(forecast_hours=24)
     print("live_forecast shape:", live_forecast_df.shape)
