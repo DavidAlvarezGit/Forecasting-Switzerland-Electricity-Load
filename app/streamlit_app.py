@@ -107,6 +107,7 @@ def main() -> None:
                 alpha=alpha,
                 calibration_windows=int(calibration_windows),
                 eval_windows=int(eval_windows),
+                history_windows=int(history_points),
                 per_horizon=per_horizon,
             )
         except Exception as exc:

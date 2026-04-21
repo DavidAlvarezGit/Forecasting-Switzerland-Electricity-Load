@@ -281,6 +281,7 @@ def evaluate_recent_backtest(
     alpha: float = 0.1,
     calibration_windows: int = 240,
     eval_windows: int = 120,
+    history_windows: int = 336,
     batch_size: int = 64,
     per_horizon: bool = True,
 ) -> dict[str, Any]:
@@ -290,6 +291,8 @@ def evaluate_recent_backtest(
         raise ValueError("calibration_windows must be >= 1.")
     if eval_windows < 1:
         raise ValueError("eval_windows must be >= 1.")
+    if history_windows < 1:
+        raise ValueError("history_windows must be >= 1.")
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("Input dataframe must have a DatetimeIndex.")
 
@@ -376,8 +379,11 @@ def evaluate_recent_backtest(
         coverage = float(np.mean(in_interval))
         mean_interval_width = float(np.mean(upper_eval - lower_eval))
 
-    x_history = np.stack([x_all[i - artifact.lookback : i] for i in anchors], axis=0)
-    y_history_true = np.stack([y_all[i : i + artifact.horizon] for i in anchors], axis=0)
+    history_count = int(min(history_windows, anchors.size))
+    anchors_history = anchors[-history_count:]
+
+    x_history = np.stack([x_all[i - artifact.lookback : i] for i in anchors_history], axis=0)
+    y_history_true = np.stack([y_all[i : i + artifact.horizon] for i in anchors_history], axis=0)
     x_history_scaled = (x_history - artifact.x_mean) / artifact.x_scale
     y_history_pred_scaled = _predict_scaled_batch(
         model=artifact.model,
@@ -387,13 +393,13 @@ def evaluate_recent_backtest(
     )
     y_history_pred = y_history_pred_scaled * artifact.y_scale + artifact.y_mean
     y_history_baseline = np.stack(
-        [np.full(artifact.horizon, y_all[i - 1], dtype=np.float32) for i in anchors],
+        [np.full(artifact.horizon, y_all[i - 1], dtype=np.float32) for i in anchors_history],
         axis=0,
     )
 
     history_records: list[dict[str, Any]] = []
     history_index: list[pd.Timestamp] = []
-    for row_idx, anchor in enumerate(anchors):
+    for row_idx, anchor in enumerate(anchors_history):
         horizon_index = df_sorted.index[int(anchor) : int(anchor) + artifact.horizon]
         pred_row = y_history_pred[row_idx]
         true_row = y_history_true[row_idx]
