@@ -37,7 +37,7 @@ The workflow is organized into four stages:
 
 1. Ingestion
 - ENTSO-E load ingestion in [src/ingestion/entsoe.py](src/ingestion/entsoe.py)
-- Open-Meteo historical, historical-forecast, and live forecast ingestion in [src/ingestion/openmeteo.py](src/ingestion/openmeteo.py)
+- Open-Meteo ingestion in [src/ingestion/openmeteo.py](src/ingestion/openmeteo.py)
 - incremental updates via JSON state files in [data/state](data/state)
 
 2. Processing and Feature Engineering
