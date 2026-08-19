@@ -18,21 +18,6 @@ This project:
 - compares the model with one simple reference: demand from the same hour yesterday;
 - presents forecasts and performance
 
-
-## How it works
-
-1. ENTSO-E load and Open-Meteo weather products are fetched incrementally and stored as Parquet partitions.
-2. Missing weather values are filled only from earlier observations.
-3. Stitched historical forecasts are used only as past encoder inputs. Future-weather training features come from `previous_day1` values predicted 24 hours before their valid time; overlapping live forecasts replace them at inference time.
-4. Training uses chronological train, validation, and test splits so future targets never leak into earlier samples.
-5. LightGBM importance is aggregated across 1-, 6-, 12-, and 24-hour targets. The model retains 32 selected signals plus load history, including all seven calendar features and at least eight forecast-weather leads.
-6. A two-layer LSTM reads the preceding 336 hours and predicts all 24 lead times in one pass.
-7. ACI maintains rolling residual buffers and adapts its miscoverage level after observed misses. Backtests delay each update until that forecast's complete horizon is observable.
-8. The only naive baseline repeats the observed demand from the same hour 24 hours earlier. It is fixed in advance and never selected from several alternatives.
-9. Streamlit serves the forward forecast, uncertainty band, recent backcasts, evaluation metrics, and data/model metadata.
-
-If interval calibration or backtesting cannot run, the dashboard keeps the point forecast available and explains which diagnostics are missing.
-
 ## Results
 
 ### Chronological test split
