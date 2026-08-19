@@ -1,6 +1,6 @@
 # Switzerland Electricity Load Forecasting
 
-An end-to-end forecasting project for Swiss electricity demand. It combines ENTSO-E load observations with Open-Meteo weather data, trains a 24-hour LSTM forecaster, calibrates uncertainty from recent residuals, and serves the result through an operational Streamlit dashboard.
+An end-to-end forecasting project for Swiss electricity demand. It combines ENTSO-E load observations with Open-Meteo weather data, trains a 24-hour LSTM forecaster, calibrates uncertainty from recent residuals, and shows the result through a Streamlit dashboard.
 
 ## Dashboard
 
