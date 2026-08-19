@@ -1,166 +1,227 @@
 # Switzerland Electricity Load Forecasting
 
-This repository builds and serves a forecasting workflow for Swiss electricity load using ENTSO-E load data and Open-Meteo weather features.
+An end-to-end forecasting project for Swiss electricity demand. It combines ENTSO-E load observations with Open-Meteo weather data, trains a 24-hour LSTM forecaster, calibrates uncertainty from recent residuals, and serves the result through an operational Streamlit dashboard.
 
-## 1. Project Overview
+## Dashboard
 
-The project predicts short-term electricity demand with an LSTM-based model and serves forecasts in a Streamlit dashboard.
+The dashboard is designed around the questions a forecast user needs to answer:
 
-Why this project matters:
+- What is the expected load over the next 24 hours?
+- When will demand peak, and how large is the uncertainty?
+- Does the model beat a persistence baseline on recent data?
+- Is the feature dataset current and compatible with the model?
 
-- electricity demand forecasting is a difficult task that matters for many companies
-- weather and seasonality strongly affect load, so feature engineering and robust ingestion are essential
-- a usable app should show both forecasts and uncertainty, not only point estimates
+It provides:
 
-Current capabilities include:
+- observed load, recent model backcasts, and the current forward forecast in one chart;
+- calibrated prediction intervals with selectable confidence and calibration mode;
+- model MAE/RMSE compared with a last-value persistence baseline;
+- interval coverage and calibration diagnostics;
+- model and dataset health metadata;
+- an exportable forecast table;
+- cache invalidation when either artifact changes on disk.
 
-- incremental ingestion from ENTSO-E and Open-Meteo
-- preprocessing and feature generation for sequence modeling
-- LSTM training
-- inference with optional prediction intervals and backtest diagnostics
-- Streamlit app for operational visualization
+Launch it from the repository root:
 
-## 2. Problem Definition
-
-Load forecasting combines non-stationary behavior, weather sensitivity, and strong intraday/weekly seasonality. A simple baseline may be stable but often underperforms during regime changes.
-
-This repository addresses that by:
-
-- consolidating multi-source hourly data into aligned datasets
-- engineering lag, rolling, and cyclical features
-- training a sequence model for multi-step forecasting (LSTM)
-- evaluating against a naive baseline and interval coverage
-
-## 3. Technical Approach
-
-The workflow is organized into four stages:
-
-1. Ingestion
-- ENTSO-E load ingestion in [src/ingestion/entsoe.py](src/ingestion/entsoe.py)
-- Open-Meteo ingestion in [src/ingestion/openmeteo.py](src/ingestion/openmeteo.py)
-- incremental updates via JSON state files in [data/state](data/state)
-
-2. Processing and Feature Engineering
-- raw-to-interim aggregation in [src/processing/helpers.py](src/processing/helpers.py)
-- full pipeline entry in [src/processing/processing.py](src/processing/processing.py)
-- LSTM feature table creation in [src/processing/features.py](src/processing/features.py)
-
-3. Modeling and Inference
-- training pipeline in [src/modeling/lstm_pipeline.py](src/modeling/lstm_pipeline.py)
-- training entrypoint in [src/modeling/train_lstm.py](src/modeling/train_lstm.py)
-- inference and backtest logic in [src/modeling/inference.py](src/modeling/inference.py)
-
-4. App
-- Streamlit dashboard in [app/streamlit_app.py](app/streamlit_app.py)
-- default model path: [data/processed/models/best_lstm_24h.pt](data/processed/models)
-- default feature table path: [data/processed/lstm_features.parquet](data/processed/lstm_features.parquet)
-
-
-
-## 4. Current Outputs
-
-The repository currently provides:
-
-- processed feature datasets under [data/processed](data/processed)
-- model checkpoints and selected model information under [data/processed/models](data/processed/models)
-- an interactive dashboard with:
-	- point forecasts
-	- prediction intervals that are created using Adaptive Conformal Inference (ACI)
-	- recent historical forecasts
-	- model vs naive baseline metrics
-
-
-## 5. How to Run
-
-### Prerequisites
-
-- Python 3.12
-- Poetry
-- ENTSO-E API key in `.env` as `ENTSOE_API_KEY`
-
-Example `.env`:
-
-```env
-ENTSOE_API_KEY=your_key_here
+```bash
+poetry run streamlit run app/streamlit_app.py
 ```
 
-### Install Dependencies
+The default paths are:
+
+- model: `data/processed/models/best_lstm_24h.pt`
+- features: `data/processed/lstm_features.parquet`
+
+Both can be changed from **Data sources** in the sidebar.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[ENTSO-E load] --> C[Hourly alignment]
+    B[Open-Meteo weather] --> C
+    C --> D[Feature engineering]
+    D --> E[LSTM training]
+    E --> F[24-hour forecast]
+    D --> F
+    F --> G[Residual calibration]
+    G --> H[Streamlit dashboard]
+```
+
+1. **Ingestion** stores incremental, partitioned load and weather observations.
+2. **Processing** aligns the sources by UTC timestamp and engineers lagged, rolling, and cyclical predictors.
+3. **Training** uses chronological train/validation/test splits, feature selection, early stopping, and a multi-output LSTM.
+4. **Inference** forecasts all 24 lead times in one pass and estimates prediction bands from recent absolute residuals.
+5. **Evaluation** compares the LSTM with a persistence baseline and reports empirical interval coverage.
+
+The dashboard uses split-conformal-style residual quantiles. With per-horizon calibration enabled, each lead time receives its own interval width; pooled calibration uses one width across the full horizon.
+
+## Quick start
+
+### Requirements
+
+- Python 3.12
+- [Poetry](https://python-poetry.org/)
+- an ENTSO-E API key only when fetching new load data
+
+### Install
 
 ```bash
 poetry install
 ```
 
-### Run Data Ingestion
+Use the Poetry environment for every command. The Parquet artifacts are written with the versions pinned in `poetry.lock`; a different global PyArrow version may not be able to read them.
+
+### Run with the existing artifacts
+
+The repository includes the feature table and selected model artifact needed by the dashboard:
+
+```bash
+poetry run streamlit run app/streamlit_app.py
+```
+
+Open the local URL printed by Streamlit, usually `http://localhost:8501`.
+
+## Rebuild the full pipeline
+
+### 1. Configure ENTSO-E
+
+Create a `.env` file at the repository root:
+
+```env
+ENTSOE_API_KEY=your_api_key_here
+```
+
+The file is ignored by Git. The weather ingestion does not require an API key.
+
+### 2. Fetch source data
 
 ```bash
 poetry run python src/ingestion/entsoe.py
 poetry run python src/ingestion/openmeteo.py
 ```
 
-### Build Aggregated and Feature Datasets
+The module entry points define their ingestion date ranges near the bottom of each file. Update those dates when extending the dataset. JSON files under `data/state/` track the latest completed timestamp so repeated runs remain incremental.
+
+### 3. Build the aligned dataset and model features
 
 ```bash
 poetry run python src/processing/processing.py
 ```
 
-### Train the LSTM Model
+This creates:
+
+- `data/interim/aggregated.parquet`
+- `data/processed/lstm_features.parquet`
+
+### 4. Train and evaluate the LSTM
 
 ```bash
 poetry run python -m src.modeling.train_lstm
 ```
 
-### Launch the Streamlit App
+Training writes:
+
+- `data/processed/models/best_lstm_24h.pt`
+- `data/processed/models/best_lstm_24h.metrics.json`
+
+The checkpoint contains the model weights, selected feature names, normalization statistics, lookback length, target name, and forecast horizon required for inference.
+
+### 5. Start the dashboard
 
 ```bash
 poetry run streamlit run app/streamlit_app.py
 ```
 
-## 6. Project Structure
+## Dashboard guide
+
+### Forecast
+
+The main chart combines recent observations, historical forecast estimates, the new forecast, and—when enabled—the prediction interval. Use **Hours to display** to shorten the forward view and **History to display** to change its context. Forecast values can be downloaded as CSV.
+
+### Performance
+
+Recent rolling windows are evaluated against a persistence baseline that repeats the final observed load across the forecast horizon.
+
+| Metric | Interpretation |
+| --- | --- |
+| MAE | Mean absolute forecast error in MW; lower is better. |
+| RMSE | Error metric that penalizes large misses more strongly. |
+| MAE improvement | Percentage reduction in MAE relative to persistence. |
+| Interval coverage | Share of observations contained by the prediction interval. |
+| Mean interval width | Typical uncertainty-band width in MW; narrower is sharper. |
+
+Coverage should be read together with width: very wide intervals can achieve high coverage without being operationally useful.
+
+### Data & model
+
+This view reports dataset coverage, missing model inputs, the target column, model lookback, feature count, inference device, and resolved artifact paths. It also exposes the latest feature rows for quick inspection.
+
+## Repository layout
 
 ```text
-load_forecasting/
-|- app/
-|  |- streamlit_app.py
-|- data/
-|  |- raw/
-|  |  |- entsoe/
-|  |  |- weather_historical/
-|  |  |- weather_historical_forecast_hourly/
-|  |  |- weather_live_forecast/
-|  |- interim/
-|  |  |- aggregated.parquet
-|  |- processed/
-|  |  |- lstm_features.parquet
-|  |  |- models/
-|  |- state/
-|     |- entsoe_state.json
-|     |- openmeteo_state.json
-|     |- openmeteo_historical_forecast_state.json
-|- notebook/
-|- src/
-|  |- ingestion/
-|  |  |- entsoe.py
-|  |  |- openmeteo.py
-|  |  |- settings.py
-|  |  |- state_utils.py
-|  |- processing/
-|  |  |- helpers.py
-|  |  |- processing.py
-|  |  |- features.py
-|  |- modeling/
-|  |  |- lstm_pipeline.py
-|  |  |- inference.py
-|  |  |- train_lstm.py
-|  |- validation/
-|     |- core.py
-|     |- data_checks.py
-|- pyproject.toml
-|- requirements.txt
-|- README.md
+.
+├── .streamlit/
+│   └── config.toml                 # Dashboard theme
+├── app/
+│   ├── dashboard_core.py           # Framework-independent analysis layer
+│   └── streamlit_app.py            # Streamlit presentation layer
+├── data/
+│   ├── raw/                         # Partitioned source data
+│   ├── interim/                     # Aligned hourly dataset
+│   ├── processed/                   # Model-ready features and artifacts
+│   └── state/                       # Incremental-ingestion checkpoints
+├── notebook/                        # Exploratory analysis and experiments
+├── src/
+│   ├── ingestion/                   # ENTSO-E and Open-Meteo clients
+│   ├── processing/                  # Alignment and feature engineering
+│   ├── modeling/                    # Training, inference, and backtesting
+│   └── validation/                  # Data validation utilities
+├── poetry.lock
+├── pyproject.toml
+└── requirements.txt                 # Streamlit deployment dependencies
 ```
 
-## 7. Future Improvements
+## Configuration
 
-- add automated retraining and model selection schedules
-- add monitoring of the model over time
-- add automated fetching of API data
+Default training settings live in `LSTMTrainConfig` in [`src/modeling/lstm_pipeline.py`](src/modeling/lstm_pipeline.py). The current defaults include:
+
+- 336-hour lookback;
+- 24-hour forecast horizon;
+- chronological 70%/15%/15% train/validation/test split;
+- early stopping with a five-epoch patience;
+- a five-layer LSTM with 128 hidden units.
+
+Operational dashboard constants—such as the number of calibration and evaluation windows—are at the top of [`app/streamlit_app.py`](app/streamlit_app.py).
+
+## Troubleshooting
+
+**`Repetition level histogram size mismatch` while reading Parquet**
+
+Run the app through Poetry. This usually indicates that a global PyArrow version differs from the version used to write the checked-in feature file.
+
+**Model or feature table not found**
+
+Build the missing stage with the commands above, or select another artifact from **Data sources** in the sidebar.
+
+**Prediction intervals are unavailable**
+
+The dashboard falls back to a point forecast when calibration cannot run. Confirm that the feature table contains the target column and enough observed history for the calibration windows.
+
+**The first run is slow**
+
+Loading the PyTorch checkpoint and calculating recent backtests is the expensive path. Results are cached for subsequent reruns and automatically invalidated when an artifact's modification time changes.
+
+## Limitations and next steps
+
+- Ingestion ranges are currently configured in the Python entry points rather than a CLI.
+- Retraining and data refreshes are not yet scheduled.
+- Forecast monitoring is local to the dashboard; production alerting and drift detection are not included.
+- Prediction intervals use recent residual calibration and do not model every source of distribution shift.
+- The current checkpoint forecasts aggregate Swiss load only.
+
+Useful next steps are configurable ingestion commands, scheduled refresh/retraining, experiment tracking, and production monitoring for error, coverage, drift, and data freshness.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
