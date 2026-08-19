@@ -102,35 +102,54 @@ def find_project_root(start: Path) -> Path:
     raise RuntimeError("Could not locate project root containing data/raw")
 
 
-def load_raw_inputs(project_root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_raw_inputs(project_root: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     weather_files = sorted((project_root / "data" / "raw" / "weather_historical").glob("year=*.parquet"))
+    forecast_history_files = sorted(
+        (project_root / "data" / "raw" / "weather_historical_forecast_hourly").glob("year=*.parquet")
+    )
     load_files = sorted((project_root / "data" / "raw" / "entsoe").glob("swiss_load_*.parquet"))
 
     if not weather_files:
         raise FileNotFoundError("No weather_historical parquet files found")
     if not load_files:
         raise FileNotFoundError("No entsoe parquet files found")
+    if not forecast_history_files:
+        raise FileNotFoundError("No weather_historical_forecast_hourly parquet files found")
 
     weather_raw = pd.concat((pd.read_parquet(path) for path in weather_files), ignore_index=True)
+    forecast_history_raw = pd.concat(
+        (pd.read_parquet(path) for path in forecast_history_files), ignore_index=True
+    )
     load_raw = pd.concat((pd.read_parquet(path) for path in load_files), ignore_index=True)
-    return weather_raw, load_raw
+    return weather_raw, forecast_history_raw, load_raw
 
 
 def normalize_raw_inputs(
     weather_raw: pd.DataFrame,
+    forecast_history_raw: pd.DataFrame,
     load_raw: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     weather = weather_raw.copy()
+    forecast_history = forecast_history_raw.copy()
     load = load_raw.copy()
 
-    missing_weather_features = [feature for feature in WEATHER_FEATURES if feature not in weather.columns]
-    if missing_weather_features:
-        raise ValueError(f"Missing fetched weather features: {missing_weather_features}")
+    for name, frame in (("historical weather", weather), ("forecast history", forecast_history)):
+        missing_weather_features = [
+            feature for feature in WEATHER_FEATURES if feature not in frame.columns
+        ]
+        if missing_weather_features:
+            raise ValueError(f"Missing {name} features: {missing_weather_features}")
 
     weather["timestamp_utc"] = pd.to_datetime(weather["timestamp_utc"], utc=True)
+    forecast_history["timestamp_utc"] = pd.to_datetime(
+        forecast_history["timestamp_utc"], utc=True
+    )
     load["timestamp_utc"] = pd.to_datetime(load["timestamp_utc"], utc=True)
     weather["city"] = weather["city"].astype(str).str.lower().str.replace(" ", "_", regex=False)
-    return weather, load
+    forecast_history["city"] = (
+        forecast_history["city"].astype(str).str.lower().str.replace(" ", "_", regex=False)
+    )
+    return weather, forecast_history, load
 
 
 def build_weather_wide(weather_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -167,12 +186,34 @@ def build_hourly_index(df_load: pd.DataFrame, df_weather: pd.DataFrame) -> pd.Da
     return pd.date_range(start=start, end=end, freq="h", tz="UTC")
 
 
+def impute_load_causally(df_load: pd.DataFrame) -> pd.DataFrame:
+    """Fill isolated load gaps without consulting later observations."""
+    load = df_load.copy()
+    if "load_mw" not in load.columns:
+        raise ValueError("Expected load_mw in load dataframe")
+
+    missing_original = load["load_mw"].isna()
+    for lag in (168, 24, 1):
+        missing = load["load_mw"].isna()
+        if not missing.any():
+            break
+        load.loc[missing, "load_mw"] = load["load_mw"].shift(lag).loc[missing]
+    load["load_was_imputed"] = missing_original.astype("int8")
+    return load
+
+
 def feature_columns(df_weather: pd.DataFrame, feature: str) -> list[str]:
     suffix = f"__{feature}"
     return [col for col in df_weather.columns if col.endswith(suffix)]
 
 
-def impute_weather(df_weather: pd.DataFrame) -> pd.DataFrame:
+def impute_weather(df_weather: pd.DataFrame, max_forward_gap: int = 6) -> pd.DataFrame:
+    """Fill weather gaps using only information available at or before each row.
+
+    Time interpolation and backward filling leak later observations into earlier
+    timestamps. A bounded forward fill is causal and leaves longer outages visible
+    so the pipeline fails instead of silently manufacturing training data.
+    """
     weather = df_weather.copy()
     continuous_features = [
         feature
@@ -183,7 +224,7 @@ def impute_weather(df_weather: pd.DataFrame) -> pd.DataFrame:
     for feature in continuous_features:
         cols = feature_columns(weather, feature)
         if cols:
-            weather[cols] = weather[cols].interpolate(method="time").ffill().bfill()
+            weather[cols] = weather[cols].ffill(limit=max_forward_gap)
 
     for feature in ZERO_FILL_FEATURES:
         cols = feature_columns(weather, feature)
@@ -192,7 +233,7 @@ def impute_weather(df_weather: pd.DataFrame) -> pd.DataFrame:
 
     is_day_cols = feature_columns(weather, "is_day")
     if is_day_cols:
-        weather[is_day_cols] = weather[is_day_cols].ffill().bfill().fillna(0.0).round().clip(0, 1)
+        weather[is_day_cols] = weather[is_day_cols].ffill(limit=max_forward_gap).round().clip(0, 1)
 
     return weather
 
@@ -212,21 +253,32 @@ def run_processing_pipeline(
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
     """Run the full raw-to-interim processing pipeline and return data plus summary metadata."""
     project_root = find_project_root(Path.cwd().resolve())
-    weather_raw, load_raw = load_raw_inputs(project_root)
-    weather_raw, load_raw = normalize_raw_inputs(weather_raw, load_raw)
+    weather_raw, forecast_history_raw, load_raw = load_raw_inputs(project_root)
+    weather_raw, forecast_history_raw, load_raw = normalize_raw_inputs(
+        weather_raw, forecast_history_raw, load_raw
+    )
 
     df_weather, weather_dedup = build_weather_wide(weather_raw)
+    df_forecast_history, forecast_history_dedup = build_weather_wide(forecast_history_raw)
     df_load = build_load_series(load_raw)
 
-    hourly_index = build_hourly_index(df_load, df_weather)
-    df_load = df_load.reindex(hourly_index).interpolate(method="time").ffill().bfill()
+    hourly_index = build_hourly_index(df_load, df_weather).intersection(df_forecast_history.index)
+    # Use only previously observed load values and retain an audit flag. This
+    # prevents the future leakage caused by bidirectional time interpolation.
+    df_load = impute_load_causally(df_load.reindex(hourly_index))
     df_weather = impute_weather(df_weather.reindex(hourly_index))
+    df_forecast_history = impute_weather(df_forecast_history.reindex(hourly_index))
 
     assert_no_missing_values(df_load, df_weather)
+    assert_no_missing_values(df_load, df_forecast_history)
 
     resolved_output = Path(output_path) if output_path is not None else project_root / "data" / "interim" / "aggregated.parquet"
     df = aggregate_to_interim(
-        dfs={"load": df_load, "weather": df_weather},
+        dfs={
+            "load": df_load,
+            "weather": df_weather,
+            "weather_forecast_history": df_forecast_history,
+        },
         output_path=str(resolved_output),
         freq=freq,
     )
@@ -235,6 +287,9 @@ def run_processing_pipeline(
         "weather_features": len(WEATHER_FEATURES),
         "city_count": int(weather_dedup["city"].nunique()),
         "weather_columns": int(df_weather.shape[1]),
+        "forecast_history_columns": int(df_forecast_history.shape[1]),
+        "forecast_history_city_count": int(forecast_history_dedup["city"].nunique()),
+        "load_rows_imputed": int(df_load["load_was_imputed"].sum()),
         "rows": int(len(df)),
         "start": str(df.index.min()),
         "end": str(df.index.max()),

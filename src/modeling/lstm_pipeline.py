@@ -45,18 +45,20 @@ class LSTMTrainConfig:
     features_path: Path = FEATURES_PATH
     lookback: int = 168 * 2
     horizon: int = 24
-    batch_size: int = 256
-    infer_batch_size: int = 64
-    epochs: int = 15
+    batch_size: int = 512
+    infer_batch_size: int = 128
+    epochs: int = 10
     learning_rate: float = 1e-3
     train_ratio: float = 0.7
     val_ratio: float = 0.15
-    top_k_features: int = 5
-    corr_threshold: float = 0.95
-    hidden_size: int = 128
-    num_layers: int = 5
+    top_k_features: int = 32
+    min_forecast_weather_features: int = 8
+    corr_threshold: float = 0.995
+    selection_horizons: tuple[int, ...] = (1, 6, 12, 24)
+    hidden_size: int = 64
+    num_layers: int = 2
     dropout: float = 0.15
-    patience: int = 5
+    patience: int = 3
     weight_decay: float = 1e-4
     model_out_path: Path = MODEL_DIR / "best_lstm_24h.pt"
 
@@ -252,14 +254,67 @@ def naive_last_value_multi_horizon(
     return np.asarray(y_true, dtype=np.float32), np.asarray(y_pred, dtype=np.float32), pd.DatetimeIndex(idx)
 
 
+def multi_horizon_baselines(
+    target: pd.Series,
+    lookback: int,
+    horizon: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray], pd.DatetimeIndex]:
+    """Build persistence and seasonal baselines from information known at issue time."""
+    y_true: list[np.ndarray] = []
+    predictions: dict[str, list[np.ndarray]] = {
+        "persistence": [],
+        "seasonal_24h": [],
+        "seasonal_168h": [],
+        "seasonal_24h_168h_blend": [],
+    }
+    idx: list[pd.Timestamp] = []
+    arr = target.to_numpy(dtype=np.float32)
+
+    minimum_anchor = max(lookback, 168)
+    horizon_offsets = np.arange(horizon)
+    for anchor in range(minimum_anchor, len(arr) - horizon + 1):
+        actual = arr[anchor : anchor + horizon]
+        persistence = np.full(horizon, arr[anchor - 1], dtype=np.float32)
+        daily = arr[anchor + horizon_offsets - 24]
+        weekly = arr[anchor + horizon_offsets - 168]
+
+        y_true.append(actual)
+        predictions["persistence"].append(persistence)
+        predictions["seasonal_24h"].append(daily)
+        predictions["seasonal_168h"].append(weekly)
+        predictions["seasonal_24h_168h_blend"].append((daily + weekly) / 2.0)
+        idx.append(target.index[anchor])
+
+    return (
+        np.asarray(y_true, dtype=np.float32),
+        {name: np.asarray(rows, dtype=np.float32) for name, rows in predictions.items()},
+        pd.DatetimeIndex(idx),
+    )
+
+
 def select_features_lgbm(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     target_col: str,
-    top_k: int = 5,
-    corr_threshold: float = 0.95,
+    top_k: int = 32,
+    corr_threshold: float = 0.995,
+    selection_horizons: tuple[int, ...] = (1, 6, 12, 24),
+    min_forecast_weather_features: int = 8,
 ) -> tuple[list[str], pd.DataFrame, dict[str, float | int]]:
+    """Rank inputs against several forecast leads using training data only.
+
+    The previous selector ranked features against the load at the same timestamp,
+    which is a different problem from multi-step forecasting. This selector sums
+    normalized LightGBM gain across representative lead times and evaluates the
+    reduced set on the matching validation targets.
+    """
     base_cols = [c for c in train_df.columns if c != target_col]
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+
+    horizons = tuple(sorted({int(step) for step in selection_horizons if int(step) > 0}))
+    if not horizons:
+        raise ValueError("selection_horizons must contain at least one positive lead")
 
     nunique = train_df[base_cols].nunique(dropna=False)
     cols_var = nunique[nunique > 1].index.tolist()
@@ -269,50 +324,88 @@ def select_features_lgbm(
     drop_corr = [col for col in upper.columns if (upper[col] > corr_threshold).any()]
     cols_filtered = [c for c in cols_var if c not in drop_corr]
 
-    x_train = train_df[cols_filtered]
-    y_train = train_df[target_col]
-    x_val = val_df[cols_filtered]
-    y_val = val_df[target_col]
+    gain = pd.Series(0.0, index=cols_filtered, dtype=float)
+    full_mae: list[float] = []
+    selected_mae: list[float] = []
 
-    model_full = lgb.LGBMRegressor(
-        objective="l1",
-        n_estimators=600,
-        learning_rate=0.03,
-        num_leaves=64,
-        random_state=42,
+    def make_ranker() -> lgb.LGBMRegressor:
+        return lgb.LGBMRegressor(
+            objective="l1",
+            n_estimators=500,
+            learning_rate=0.03,
+            num_leaves=48,
+            random_state=42,
+            verbosity=-1,
+        )
+
+    fitted_by_horizon: list[tuple[int, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]] = []
+    for step in horizons:
+        train_target = train_df[target_col].shift(-step).dropna()
+        val_target = val_df[target_col].shift(-step).dropna()
+        x_train = train_df.loc[train_target.index, cols_filtered]
+        x_val = val_df.loc[val_target.index, cols_filtered]
+
+        model_full = make_ranker()
+        model_full.fit(x_train, train_target)
+        pred_full = np.asarray(model_full.predict(x_val), dtype=np.float32)
+        full_mae.append(float(mean_absolute_error(val_target, pred_full)))
+
+        step_gain = pd.Series(
+            model_full.booster_.feature_importance(importance_type="gain"),
+            index=cols_filtered,
+            dtype=float,
+        )
+        if step_gain.sum() > 0:
+            gain = gain.add(step_gain / step_gain.sum(), fill_value=0.0)
+        fitted_by_horizon.append((step, x_train, train_target, x_val, val_target))
+
+    importance_df = (
+        gain.rename("gain")
+        .sort_values(ascending=False)
+        .rename_axis("feature")
+        .reset_index()
     )
-    model_full.fit(x_train, y_train)
-    pred_full = np.asarray(model_full.predict(x_val), dtype=np.float32)
-    mae_full = mean_absolute_error(y_val, pred_full)
 
-    importance_df = pd.DataFrame(
-        {
-            "feature": x_train.columns,
-            "gain": model_full.booster_.feature_importance(importance_type="gain"),
-        }
-    ).sort_values("gain", ascending=False)
+    calendar_features = [
+        column
+        for column in ("hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos", "is_weekend")
+        if column in cols_filtered
+    ]
+    ranked = importance_df[importance_df["gain"] > 0]["feature"].tolist()
+    ranked_forecast_weather = [
+        column for column in ranked if column.startswith("forecast_ch_mean_")
+    ][:min_forecast_weather_features]
 
-    selected = importance_df[importance_df["gain"] > 0]["feature"].head(top_k).tolist()
-    if len(selected) == 0:
-        selected = importance_df["feature"].head(min(top_k, len(importance_df))).tolist()
+    selected = list(dict.fromkeys([*calendar_features, *ranked_forecast_weather]))
+    for column in ranked:
+        if column not in selected:
+            selected.append(column)
+        if len(selected) >= top_k:
+            break
+    if len(selected) < min(top_k, len(cols_filtered)):
+        for column in importance_df["feature"]:
+            if column not in selected:
+                selected.append(column)
+            if len(selected) >= top_k:
+                break
 
-    model_sel = lgb.LGBMRegressor(
-        objective="l1",
-        n_estimators=600,
-        learning_rate=0.03,
-        num_leaves=64,
-        random_state=42,
-    )
-    model_sel.fit(x_train[selected], y_train)
-    pred_sel = np.asarray(model_sel.predict(x_val[selected]), dtype=np.float32)
-    mae_sel = mean_absolute_error(y_val, pred_sel)
+    for _, x_train, train_target, x_val, val_target in fitted_by_horizon:
+        model_selected = make_ranker()
+        model_selected.fit(x_train[selected], train_target)
+        pred_selected = np.asarray(model_selected.predict(x_val[selected]), dtype=np.float32)
+        selected_mae.append(float(mean_absolute_error(val_target, pred_selected)))
 
     summary: dict[str, float | int] = {
         "n_base": len(base_cols),
         "n_after_variance_corr": len(cols_filtered),
         "n_selected": len(selected),
-        "val_mae_full_filtered": float(mae_full),
-        "val_mae_selected": float(mae_sel),
+        "n_forecast_weather_selected": sum(
+            column.startswith("forecast_ch_mean_") for column in selected
+        ),
+        "n_calendar_selected": sum(column in calendar_features for column in selected),
+        "selection_horizon_count": len(horizons),
+        "val_mae_full_filtered": float(np.mean(full_mae)),
+        "val_mae_selected": float(np.mean(selected_mae)),
     }
     return selected, importance_df, summary
 
@@ -464,6 +557,7 @@ def save_model_artifacts(
     config.model_out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "model_version": 2,
             "model_state_dict": model.state_dict(),
             "feature_cols": feature_cols,
             "lookback": config.lookback,
@@ -473,6 +567,11 @@ def save_model_artifacts(
             "x_scaler_scale": x_scaler.scale_,
             "y_scaler_mean": y_scaler.mean_,
             "y_scaler_scale": y_scaler.scale_,
+            "feature_selection_method": "multi_horizon_lightgbm_gain",
+            "selection_horizons": list(config.selection_horizons),
+            "uses_fixed_vintage_weather": any(
+                column.startswith("forecast_ch_mean_") for column in feature_cols
+            ),
         },
         config.model_out_path,
     )
@@ -487,12 +586,30 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
     df = load_lstm_dataset(cfg.features_path, target_col=cfg.target_col)
     train_df, val_df, test_df = split_dataset(df, train_ratio=cfg.train_ratio, val_ratio=cfg.val_ratio)
 
-    y_test_true_naive, y_test_pred_naive, _ = naive_last_value_multi_horizon(
+    y_val_true_baseline, y_val_baselines, _ = multi_horizon_baselines(
+        val_df[cfg.target_col],
+        lookback=cfg.lookback,
+        horizon=cfg.horizon,
+    )
+    baseline_validation_metrics = {
+        name: evaluate_metrics(y_val_true_baseline, prediction)
+        for name, prediction in y_val_baselines.items()
+    }
+    selected_baseline_name = min(
+        baseline_validation_metrics,
+        key=lambda name: baseline_validation_metrics[name]["mae"],
+    )
+
+    y_test_true_baseline, y_test_baselines, _ = multi_horizon_baselines(
         test_df[cfg.target_col],
         lookback=cfg.lookback,
         horizon=cfg.horizon,
     )
-    naive_metrics = evaluate_metrics(y_test_true_naive, y_test_pred_naive)
+    baseline_test_metrics = {
+        name: evaluate_metrics(y_test_true_baseline, prediction)
+        for name, prediction in y_test_baselines.items()
+    }
+    selected_baseline_metrics = baseline_test_metrics[selected_baseline_name]
 
     selected_feature_cols, importance_df, fs_summary = select_features_lgbm(
         train_df=train_df,
@@ -500,6 +617,8 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
         target_col=cfg.target_col,
         top_k=cfg.top_k_features,
         corr_threshold=cfg.corr_threshold,
+        selection_horizons=cfg.selection_horizons,
+        min_forecast_weather_features=cfg.min_forecast_weather_features,
     )
 
     feature_cols = list(selected_feature_cols)
@@ -565,7 +684,14 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
 
     compare_df = pd.DataFrame(
         [
-            {"model": "naive_last_value_24h", **naive_metrics},
+            *(
+                {
+                    "model": name,
+                    "selected_on_validation": name == selected_baseline_name,
+                    **metrics,
+                }
+                for name, metrics in baseline_test_metrics.items()
+            ),
             {"model": "lstm_24h", **lstm_metrics},
         ]
     ).sort_values("mae")
@@ -584,7 +710,10 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
             {
                 "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()},
                 "feature_selection": fs_summary,
-                "naive_metrics": naive_metrics,
+                "selected_baseline": selected_baseline_name,
+                "baseline_validation_metrics": baseline_validation_metrics,
+                "baseline_test_metrics": baseline_test_metrics,
+                "selected_baseline_metrics": selected_baseline_metrics,
                 "lstm_metrics": lstm_metrics,
             },
             fp,

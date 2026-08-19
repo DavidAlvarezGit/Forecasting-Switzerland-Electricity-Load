@@ -97,6 +97,16 @@ def _format_timestamp(value: Any) -> str:
     return pd.Timestamp(value).strftime("%d %b %Y · %H:%M")
 
 
+def _baseline_label(name: Any) -> str:
+    labels = {
+        "persistence": "Persistence",
+        "seasonal_24h": "Previous day",
+        "seasonal_168h": "Previous week",
+        "seasonal_24h_168h_blend": "Day/week seasonal blend",
+    }
+    return labels.get(str(name), str(name).replace("_", " ").title())
+
+
 def _inject_styles() -> None:
     st.markdown(
         f"""
@@ -188,7 +198,7 @@ def _render_hero(results: DashboardResults) -> None:
             <h1 class="forecast-title">Electricity load forecast</h1>
             <p class="forecast-subtitle">
                 A decision-ready view of near-term national demand, model uncertainty,
-                and recent performance against a persistence baseline.
+                and recent performance against a strong seasonal baseline suite.
             </p>
             <span class="forecast-chip">● Data through {updated}</span>
             <span class="forecast-chip">{horizon}-hour model horizon</span>
@@ -321,15 +331,22 @@ def _forecast_chart(
 
 def _performance_chart(results: DashboardResults) -> alt.Chart | None:
     history = results.backtest_history
-    required = ["true_load_mw", "forecast_load_mw", "naive_baseline_load_mw"]
+    baseline_column = (
+        "baseline_load_mw"
+        if "baseline_load_mw" in history.columns
+        else "naive_baseline_load_mw"
+    )
+    required = ["true_load_mw", "forecast_load_mw", baseline_column]
     if history.empty or not set(required).issubset(history.columns):
         return None
+
+    baseline_label = _baseline_label(results.metadata.get("baseline_name"))
 
     chart_df = history[required].tail(240).rename(
         columns={
             "true_load_mw": "Observed",
             "forecast_load_mw": "LSTM forecast",
-            "naive_baseline_load_mw": "Persistence baseline",
+            baseline_column: baseline_label,
         }
     )
     chart_df = _timestamp_column(chart_df).melt(
@@ -345,7 +362,7 @@ def _performance_chart(results: DashboardResults) -> alt.Chart | None:
                 "series:N",
                 title=None,
                 scale=alt.Scale(
-                    domain=["Observed", "LSTM forecast", "Persistence baseline"],
+                    domain=["Observed", "LSTM forecast", baseline_label],
                     range=[BLUE, SWISS_RED, SLATE],
                 ),
                 legend=alt.Legend(orient="top"),
@@ -354,7 +371,7 @@ def _performance_chart(results: DashboardResults) -> alt.Chart | None:
                 "series:N",
                 title=None,
                 scale=alt.Scale(
-                    domain=["Observed", "LSTM forecast", "Persistence baseline"],
+                    domain=["Observed", "LSTM forecast", baseline_label],
                     range=[[1, 0], [1, 0], [6, 4]],
                 ),
                 legend=None,
@@ -419,18 +436,20 @@ def _render_performance_tab(results: DashboardResults) -> None:
     st.markdown('<p class="section-kicker">Recent holdout windows</p>', unsafe_allow_html=True)
     st.subheader("Model performance")
     st.caption(
-        "The persistence baseline repeats the last observed load across the forecast horizon. "
-        "Lower error is better; interval coverage should be close to its target."
+        "The headline benchmark is the lowest-error member of a predeclared persistence, "
+        "previous-day, previous-week, and day/week-blend suite on this recent evaluation. "
+        "Lower error is better; ACI coverage should remain close to its target."
     )
 
     columns = st.columns(4)
+    baseline_label = _baseline_label(results.metadata.get("baseline_name"))
     columns[0].metric("Model MAE", _format_mw(metrics.get("mae_model"), 1))
-    columns[1].metric("Baseline MAE", _format_mw(metrics.get("mae_baseline"), 1))
+    columns[1].metric(f"{baseline_label} MAE", _format_mw(metrics.get("mae_baseline"), 1))
     improvement = metrics.get("mae_improvement_pct")
     columns[2].metric(
         "MAE improvement",
         f"{float(improvement):.1f}%" if improvement is not None else "—",
-        delta="vs persistence baseline",
+        delta=f"vs {baseline_label.lower()}",
         delta_color="off",
     )
     coverage = metrics.get("coverage")
@@ -444,6 +463,31 @@ def _render_performance_tab(results: DashboardResults) -> None:
     if chart is not None:
         st.altair_chart(chart, use_container_width=True)
 
+    baseline_metrics = results.metadata.get("baseline_eval_metrics", {})
+    if isinstance(baseline_metrics, dict) and baseline_metrics:
+        baseline_rows = [
+            {
+                "Baseline": _baseline_label(name),
+                "MAE (MW)": values.get("mae"),
+                "RMSE (MW)": values.get("rmse"),
+            }
+            for name, values in baseline_metrics.items()
+            if isinstance(values, dict)
+        ]
+        with st.expander("Compare every baseline"):
+            st.dataframe(
+                pd.DataFrame(baseline_rows).sort_values("MAE (MW)").round(1),
+                hide_index=True,
+                use_container_width=True,
+            )
+            calibration_choice = _baseline_label(
+                results.metadata.get("baseline_selected_on_calibration")
+            )
+            st.caption(
+                f"The calibration period would have selected {calibration_choice}. "
+                "All candidates remain visible to prevent a weak benchmark from overstating model skill."
+            )
+
     left, right = st.columns([1.3, 1])
     with left:
         st.markdown("#### Error details")
@@ -451,7 +495,7 @@ def _render_performance_tab(results: DashboardResults) -> None:
             {
                 "Metric": ["MAE", "RMSE"],
                 "LSTM": [metrics.get("mae_model"), metrics.get("rmse_model")],
-                "Persistence baseline": [
+                baseline_label: [
                     metrics.get("mae_baseline"),
                     metrics.get("rmse_baseline"),
                 ],
@@ -463,6 +507,7 @@ def _render_performance_tab(results: DashboardResults) -> None:
         st.write(f"**Evaluation windows:** {int(metrics.get('n_eval_windows', 0)):,}")
         st.write(f"**Calibration windows:** {int(metrics.get('n_calibration_windows', 0)):,}")
         st.write(f"**Mean interval width:** {_format_mw(metrics.get('mean_interval_width'), 1)}")
+        st.write(f"**ACI learning rate:** {float(metrics.get('aci_eta', 0)):.3f}")
 
 
 def _render_data_tab(
@@ -489,6 +534,8 @@ def _render_data_tab(
         st.metric("Forecast horizon", f"{int(metadata['horizon'])} hours")
         st.write(f"**Lookback window:** {int(metadata['lookback'])} hours")
         st.write(f"**Input features:** {int(metadata['feature_count'])}")
+        st.write(f"**Forecast-weather inputs:** {int(metadata['forecast_weather_feature_count'])}")
+        st.write(f"**Artifact version:** {int(metadata['model_version'])}")
         st.write(f"**Inference device:** `{metadata['device']}`")
         st.write(f"**Interval calibration:** {metadata['interval_method']}")
 
@@ -577,7 +624,7 @@ def main() -> None:
             "Calibrate each horizon step",
             value=True,
             disabled=not include_intervals,
-            help="Uses a separate residual quantile for each forecast lead time.",
+            help="Maintains a separate adaptive conformal state for each forecast lead time.",
         )
         st.caption(
             f"Diagnostics use {CALIBRATION_WINDOWS} calibration and "

@@ -185,6 +185,8 @@ def build_dashboard_results(
             "mean_interval_width",
             "n_eval_windows",
             "n_calibration_windows",
+            "aci_eta",
+            "aci_alpha_t_mean",
         ):
             value = backtest.get(key)
             if value is not None:
@@ -198,12 +200,23 @@ def build_dashboard_results(
         "dataset_end": df.index.max(),
         "missing_share": missing_share,
         "feature_count": int(len(artifact.feature_cols)),
+        "forecast_weather_feature_count": sum(
+            column.startswith("forecast_ch_mean_") for column in artifact.feature_cols
+        ),
+        "model_version": int(getattr(artifact, "model_version", 1)),
         "target_column": artifact.target_col,
         "lookback": int(artifact.lookback),
         "horizon": int(artifact.horizon),
         "device": str(artifact.device),
         "confidence": float(confidence),
-        "interval_method": "Per horizon" if per_horizon else "Pooled",
+        "interval_method": f"ACI · {'per horizon' if per_horizon else 'pooled'}",
+        "baseline_name": backtest.get("baseline_name", "unavailable") if backtest else "unavailable",
+        "baseline_selected_on_calibration": (
+            backtest.get("baseline_selected_on_calibration", "unavailable")
+            if backtest
+            else "unavailable"
+        ),
+        "baseline_eval_metrics": backtest.get("baseline_eval_metrics", {}) if backtest else {},
     }
 
     return DashboardResults(

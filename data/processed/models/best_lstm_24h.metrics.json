@@ -1,0 +1,84 @@
+{
+  "config": {
+    "target_col": "load_load_mw",
+    "features_path": ".validation-features-v2.parquet",
+    "lookback": 336,
+    "horizon": 24,
+    "batch_size": 512,
+    "infer_batch_size": 128,
+    "epochs": 10,
+    "learning_rate": 0.001,
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "top_k_features": 32,
+    "min_forecast_weather_features": 8,
+    "corr_threshold": 0.995,
+    "selection_horizons": [
+      1,
+      6,
+      12,
+      24
+    ],
+    "hidden_size": 64,
+    "num_layers": 2,
+    "dropout": 0.15,
+    "patience": 3,
+    "weight_decay": 0.0001,
+    "model_out_path": ".validation-model-v2.pt"
+  },
+  "feature_selection": {
+    "n_base": 439,
+    "n_after_variance_corr": 387,
+    "n_selected": 32,
+    "n_forecast_weather_selected": 8,
+    "n_calendar_selected": 7,
+    "selection_horizon_count": 4,
+    "val_mae_full_filtered": 310.5519922143692,
+    "val_mae_selected": 311.7769627882166
+  },
+  "selected_baseline": "seasonal_24h_168h_blend",
+  "baseline_validation_metrics": {
+    "persistence": {
+      "mae": 796.6925659179688,
+      "rmse": 1003.9428208319435
+    },
+    "seasonal_24h": {
+      "mae": 400.5950622558594,
+      "rmse": 568.3365805136953
+    },
+    "seasonal_168h": {
+      "mae": 442.7694396972656,
+      "rmse": 596.111671585115
+    },
+    "seasonal_24h_168h_blend": {
+      "mae": 348.24774169921875,
+      "rmse": 460.4187631928134
+    }
+  },
+  "baseline_test_metrics": {
+    "persistence": {
+      "mae": 676.3110961914062,
+      "rmse": 861.7047058012391
+    },
+    "seasonal_24h": {
+      "mae": 513.6361083984375,
+      "rmse": 674.6007847238246
+    },
+    "seasonal_168h": {
+      "mae": 545.4569091796875,
+      "rmse": 718.444456795374
+    },
+    "seasonal_24h_168h_blend": {
+      "mae": 444.24224853515625,
+      "rmse": 578.3292477041084
+    }
+  },
+  "selected_baseline_metrics": {
+    "mae": 444.24224853515625,
+    "rmse": 578.3292477041084
+  },
+  "lstm_metrics": {
+    "mae": 420.2131652832031,
+    "rmse": 533.7405444127324
+  }
+}

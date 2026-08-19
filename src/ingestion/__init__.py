@@ -3,6 +3,7 @@ from .openmeteo import (
     ingest_weather_historical,
     ingest_weather_historical_forecast,
     ingest_weather_live_forecast,
+    ingest_weather_previous_runs,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "ingest_weather_historical",
     "ingest_weather_historical_forecast",
     "ingest_weather_live_forecast",
+    "ingest_weather_previous_runs",
 ]

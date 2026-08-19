@@ -25,6 +25,7 @@ else:
 
 OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPENMETEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+OPENMETEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 CITIES = [
@@ -60,7 +61,18 @@ STATE_FILE = DATA_ROOT / "state" / "openmeteo_state.json"
 
 DATASET_HISTORICAL = "weather_historical"
 DATASET_HISTORICAL_FORECAST_HOURLY = "weather_historical_forecast_hourly"
+DATASET_PREVIOUS_RUNS = "weather_previous_runs"
 DATASET_LIVE_FORECAST = "weather_live_forecast"
+
+PREVIOUS_RUN_BASE_VARS = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "precipitation",
+    "snowfall",
+    "cloud_cover",
+    "wind_speed_10m",
+    "surface_pressure",
+]
 
 
 def load_state() -> dict[str, str]:
@@ -331,6 +343,50 @@ def ingest_weather_historical_forecast(
     return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
 
 
+def ingest_weather_previous_runs(
+    start_date: str,
+    end_date: str,
+    previous_day: int = 1,
+    base_vars: list[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch fixed-vintage forecasts for leakage-safe model training.
+
+    ``previous_day=1`` returns each target-time value as predicted 24 hours
+    earlier, unlike the stitched Historical Forecast API series.
+    """
+    if previous_day < 1 or previous_day > 7:
+        raise ValueError("previous_day must be between 1 and 7")
+
+    variables = base_vars or PREVIOUS_RUN_BASE_VARS
+    hourly_vars = [f"{variable}_previous_day{previous_day}" for variable in variables]
+    state_key = f"{DATASET_PREVIOUS_RUNS}_day{previous_day}"
+    state = load_state()
+    last_ts = get_last_timestamp(state, state_key)
+    date_range = _build_date_range(start_date, end_date, last_ts)
+    if date_range is None:
+        return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
+
+    effective_start, effective_end = date_range
+    params = _build_common_params(hourly_vars)
+    params["start_date"] = effective_start
+    params["end_date"] = effective_end
+
+    client = build_client()
+    responses = fetch_with_retries(client, OPENMETEO_PREVIOUS_RUNS_URL, params)
+    df = parse_hourly_responses(responses, hourly_vars)
+    if df.empty:
+        return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
+
+    save_partitioned(
+        df=df,
+        dataset=DATASET_PREVIOUS_RUNS,
+        time_col="timestamp_utc",
+        dedupe_cols=["timestamp_utc", "location_id"],
+    )
+    update_state(state, state_key, df["timestamp_utc"].max())
+    return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
+
+
 def ingest_weather_live_forecast(
     forecast_hours: int = 24,
     hourly_vars: list[str] | None = None,
@@ -371,6 +427,13 @@ if __name__ == "__main__":
         end_date="2026-04-19",
     )
     print("historical_forecast_hourly shape:", historical_forecast_hourly_df.shape)
+
+    previous_runs_df = ingest_weather_previous_runs(
+        start_date="2024-01-01",
+        end_date="2026-04-19",
+        previous_day=1,
+    )
+    print("previous_runs shape:", previous_runs_df.shape)
 
     live_forecast_df = ingest_weather_live_forecast(forecast_hours=24)
     print("live_forecast shape:", live_forecast_df.shape)
