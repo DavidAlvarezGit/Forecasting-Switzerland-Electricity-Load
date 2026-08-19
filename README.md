@@ -1,29 +1,28 @@
 # Switzerland Electricity Load Forecasting
 
-Forecast aggregate Swiss electricity demand for the next 24 hours from load history, weather forecasts, observed weather, and calendar signals. The project covers incremental data collection, causal feature engineering, LSTM training, adaptive uncertainty calibration, recent backtesting, and an interactive Streamlit dashboard.
+Forecast aggregate Swiss electricity demand for the next 24 hours from load history, weather forecasts, observed weather, and calendar signals. The project covers incremental data collection,  feature engineering, LSTM training, adaptive uncertainty calibration, recent backtesting, and an interactive Streamlit dashboard.
 
 ## Why this project exists
 
-Electricity demand changes with the hour, weekday, season, weather, and recent consumption pattern. A useful forecast must therefore do more than produce one number: it should preserve information timing, compare itself with a clear reference forecast, communicate uncertainty, and expose the freshness of its inputs.
+Electricity demand changes with the hour, weekday, season, weather, and recent consumption pattern. A useful forecast must therefore do more than produce one number: it should preserve information timing, compare itself with a clear reference forecast and communicate uncertainty.
 
 This project:
 
 - collects Swiss load observations from ENTSO-E;
-- collects observed, historical-forecast, fixed-vintage, and live weather data from Open-Meteo;
+- collects weather data from Open-Meteo;
 - aligns the sources into an hourly UTC dataset;
-- engineers lagged, rolling, forecast-weather, and cyclical features without backward filling;
+- engineers lagged, rolling, forecast-weather, and cyclical features ;
 - ranks predictors against several points in the complete 24-hour forecast horizon;
 - predicts all 24 lead times with one LSTM;
 - calibrates intervals with Adaptive Conformal Inference (ACI);
 - compares the model with one simple reference: demand from the same hour yesterday;
-- presents forecasts, performance, and artifact health in Streamlit.
+- presents forecasts and performance
 
-It is a forecasting prototype, not a production dispatch or trading system.
 
 ## How it works
 
 1. ENTSO-E load and Open-Meteo weather products are fetched incrementally and stored as Parquet partitions.
-2. Missing weather values are filled only from earlier observations. The two missing load hours in the current snapshot use the same hour one week earlier and remain marked by an audit feature.
+2. Missing weather values are filled only from earlier observations.
 3. Stitched historical forecasts are used only as past encoder inputs. Future-weather training features come from `previous_day1` values predicted 24 hours before their valid time; overlapping live forecasts replace them at inference time.
 4. Training uses chronological train, validation, and test splits so future targets never leak into earlier samples.
 5. LightGBM importance is aggregated across 1-, 6-, 12-, and 24-hour targets. The model retains 32 selected signals plus load history, including all seven calendar features and at least eight forecast-weather leads.
