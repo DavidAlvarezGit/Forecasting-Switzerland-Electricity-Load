@@ -8,18 +8,14 @@ The dashboard is designed around the questions a forecast user needs to answer:
 
 - What is the expected load over the next 24 hours?
 - When will demand peak, and how large is the uncertainty?
-- Does the model beat a persistence baseline on recent data?
-- Is the feature dataset current and compatible with the model?
+- Does the model beat a naive baseline on recent data?
 
 It provides:
 
 - observed load, recent model backcasts, and the current forward forecast in one chart;
 - calibrated prediction intervals with selectable confidence and calibration mode;
-- model MAE/RMSE compared with a last-value persistence baseline;
-- interval coverage and calibration diagnostics;
-- model and dataset health metadata;
-- an exportable forecast table;
-- cache invalidation when either artifact changes on disk.
+- model MAE/RMSE compared with a last-value naive baseline;
+- interval coverage and calibration diagnostics
 
 Launch it from the repository root:
 
@@ -212,13 +208,6 @@ The dashboard falls back to a point forecast when calibration cannot run. Confir
 
 Loading the PyTorch checkpoint and calculating recent backtests is the expensive path. Results are cached for subsequent reruns and automatically invalidated when an artifact's modification time changes.
 
-## Limitations and next steps
-
-- Ingestion ranges are currently configured in the Python entry points rather than a CLI.
-- Retraining and data refreshes are not yet scheduled.
-- Forecast monitoring is local to the dashboard; production alerting and drift detection are not included.
-- Prediction intervals use recent residual calibration and do not model every source of distribution shift.
-- The current checkpoint forecasts aggregate Swiss load only.
 
 Useful next steps are configurable ingestion commands, scheduled refresh/retraining, experiment tracking, and production monitoring for error, coverage, drift, and data freshness.
 
