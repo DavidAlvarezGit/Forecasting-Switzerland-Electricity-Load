@@ -209,7 +209,11 @@ def build_dashboard_results(
         "horizon": int(artifact.horizon),
         "device": str(artifact.device),
         "confidence": float(confidence),
-        "interval_method": f"ACI · {'per horizon' if per_horizon else 'pooled'}",
+        "interval_method": (
+            "Adaptive ranges · separate for each forecast hour"
+            if per_horizon
+            else "Adaptive ranges · shared across all forecast hours"
+        ),
         "baseline_name": backtest.get("baseline_name", "unavailable") if backtest else "unavailable",
         "baseline_selected_on_calibration": (
             backtest.get("baseline_selected_on_calibration", "unavailable")

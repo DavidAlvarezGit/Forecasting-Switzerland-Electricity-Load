@@ -197,11 +197,11 @@ def _render_hero(results: DashboardResults) -> None:
             <div class="forecast-eyebrow">Swiss grid outlook</div>
             <h1 class="forecast-title">Electricity load forecast</h1>
             <p class="forecast-subtitle">
-                A decision-ready view of near-term national demand, model uncertainty,
-                and recent performance against a strong seasonal baseline suite.
+                See expected national demand, the likely forecast range, and how the
+                model recently compared with simple forecasts based on past demand.
             </p>
             <span class="forecast-chip">● Data through {updated}</span>
-            <span class="forecast-chip">{horizon}-hour model horizon</span>
+            <span class="forecast-chip">Forecasts {horizon} hours ahead</span>
             <span class="forecast-chip">{confidence:.0%} confidence</span>
         </div>
         """,
@@ -430,24 +430,25 @@ def _render_forecast_tab(
 def _render_performance_tab(results: DashboardResults) -> None:
     metrics = results.metrics
     if not metrics:
-        st.info("Performance diagnostics are not available for this model and dataset.")
+        st.info("Recent accuracy results are not available for this model and dataset.")
         return
 
-    st.markdown('<p class="section-kicker">Recent holdout windows</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-kicker">Recent accuracy check</p>', unsafe_allow_html=True)
     st.subheader("Model performance")
     st.caption(
-        "The headline benchmark is the lowest-error member of a predeclared persistence, "
-        "previous-day, previous-week, and day/week-blend suite on this recent evaluation. "
-        "Lower error is better; ACI coverage should remain close to its target."
+        "We compare the model with four simple forecasts: repeat the latest value, use the "
+        "same hour yesterday, use the same hour last week, or average yesterday and last week. "
+        "The dashboard shows the simple forecast with the smallest average error. MAE is the "
+        "average difference from the real demand, so smaller is better."
     )
 
     columns = st.columns(4)
     baseline_label = _baseline_label(results.metadata.get("baseline_name"))
-    columns[0].metric("Model MAE", _format_mw(metrics.get("mae_model"), 1))
-    columns[1].metric(f"{baseline_label} MAE", _format_mw(metrics.get("mae_baseline"), 1))
+    columns[0].metric("Model average error", _format_mw(metrics.get("mae_model"), 1))
+    columns[1].metric(f"{baseline_label} average error", _format_mw(metrics.get("mae_baseline"), 1))
     improvement = metrics.get("mae_improvement_pct")
     columns[2].metric(
-        "MAE improvement",
+        "Error reduction",
         f"{float(improvement):.1f}%" if improvement is not None else "—",
         delta=f"vs {baseline_label.lower()}",
         delta_color="off",
@@ -457,7 +458,7 @@ def _render_performance_tab(results: DashboardResults) -> None:
     coverage_delta = None
     if coverage is not None and target is not None and math.isfinite(float(coverage)):
         coverage_delta = f"{float(coverage) - float(target):+.1%} vs target"
-    columns[3].metric("Interval coverage", _format_percent(coverage), delta=coverage_delta)
+    columns[3].metric("Actual values inside forecast range", _format_percent(coverage), delta=coverage_delta)
 
     chart = _performance_chart(results)
     if chart is not None:
@@ -474,7 +475,7 @@ def _render_performance_tab(results: DashboardResults) -> None:
             for name, values in baseline_metrics.items()
             if isinstance(values, dict)
         ]
-        with st.expander("Compare every baseline"):
+        with st.expander("Compare all simple forecasts"):
             st.dataframe(
                 pd.DataFrame(baseline_rows).sort_values("MAE (MW)").round(1),
                 hide_index=True,
@@ -484,8 +485,8 @@ def _render_performance_tab(results: DashboardResults) -> None:
                 results.metadata.get("baseline_selected_on_calibration")
             )
             st.caption(
-                f"The calibration period would have selected {calibration_choice}. "
-                "All candidates remain visible to prevent a weak benchmark from overstating model skill."
+                f"During the earlier comparison period, {calibration_choice} had the smallest error. "
+                "All four methods are shown so you can judge the model against each one."
             )
 
     left, right = st.columns([1.3, 1])
@@ -493,7 +494,7 @@ def _render_performance_tab(results: DashboardResults) -> None:
         st.markdown("#### Error details")
         details = pd.DataFrame(
             {
-                "Metric": ["MAE", "RMSE"],
+                "Metric": ["Average error (MAE)", "Large-error score (RMSE)"],
                 "LSTM": [metrics.get("mae_model"), metrics.get("rmse_model")],
                 baseline_label: [
                     metrics.get("mae_baseline"),
@@ -503,11 +504,11 @@ def _render_performance_tab(results: DashboardResults) -> None:
         )
         st.dataframe(details.round(1), hide_index=True, use_container_width=True)
     with right:
-        st.markdown("#### Evaluation scope")
-        st.write(f"**Evaluation windows:** {int(metrics.get('n_eval_windows', 0)):,}")
-        st.write(f"**Calibration windows:** {int(metrics.get('n_calibration_windows', 0)):,}")
-        st.write(f"**Mean interval width:** {_format_mw(metrics.get('mean_interval_width'), 1)}")
-        st.write(f"**ACI learning rate:** {float(metrics.get('aci_eta', 0)):.3f}")
+        st.markdown("#### How this was checked")
+        st.write(f"**Recent forecasts checked:** {int(metrics.get('n_eval_windows', 0)):,}")
+        st.write(f"**Earlier forecasts used to set the range:** {int(metrics.get('n_calibration_windows', 0)):,}")
+        st.write(f"**Average forecast-range width:** {_format_mw(metrics.get('mean_interval_width'), 1)}")
+        st.write(f"**Range adjustment speed:** {float(metrics.get('aci_eta', 0)):.3f}")
 
 
 def _render_data_tab(
@@ -530,16 +531,16 @@ def _render_data_tab(
         st.write(f"**Missing model inputs:** {_format_percent(metadata['missing_share'], 2)}")
         st.write(f"**Target:** `{metadata['target_column']}`")
     with right:
-        st.markdown("#### LSTM artifact")
+        st.markdown("#### Model details")
         st.metric("Forecast horizon", f"{int(metadata['horizon'])} hours")
         st.write(f"**Lookback window:** {int(metadata['lookback'])} hours")
         st.write(f"**Input features:** {int(metadata['feature_count'])}")
         st.write(f"**Forecast-weather inputs:** {int(metadata['forecast_weather_feature_count'])}")
-        st.write(f"**Artifact version:** {int(metadata['model_version'])}")
-        st.write(f"**Inference device:** `{metadata['device']}`")
-        st.write(f"**Interval calibration:** {metadata['interval_method']}")
+        st.write(f"**Model file version:** {int(metadata['model_version'])}")
+        st.write(f"**Calculation device:** `{metadata['device']}`")
+        st.write(f"**Forecast range:** {metadata['interval_method']}")
 
-    with st.expander("Artifact paths"):
+    with st.expander("Files used"):
         st.code(f"Model:    {model_path}\nFeatures: {features_path}", language="text")
 
     with st.expander("Latest feature rows"):
@@ -570,13 +571,13 @@ def main() -> None:
         st.markdown("## ⚡ Swiss Load Outlook")
         st.caption("Operational forecast controls")
         with st.expander("Data sources"):
-            model_value = st.text_input("Model artifact", value=DEFAULT_MODEL_PATH)
+            model_value = st.text_input("Model file", value=DEFAULT_MODEL_PATH)
             features_value = st.text_input("Feature table", value=DEFAULT_FEATURES_PATH)
 
     model_path = _resolve_path(model_value)
     features_path = _resolve_path(features_value)
     if not model_path.is_file():
-        _render_missing_file(model_path, "Model artifact")
+        _render_missing_file(model_path, "Model file")
         st.stop()
     if not features_path.is_file():
         _render_missing_file(features_path, "Feature table")
@@ -588,7 +589,7 @@ def main() -> None:
         artifact = _load_artifact(str(model_path), model_modified_ns)
         df = _load_features(str(features_path), features_modified_ns)
     except Exception as exc:
-        st.error("The dashboard could not load its artifacts.")
+        st.error("The dashboard could not load its model or feature data.")
         st.exception(exc)
         st.stop()
 
@@ -621,14 +622,14 @@ def main() -> None:
             disabled=not include_intervals,
         )
         per_horizon = st.checkbox(
-            "Calibrate each horizon step",
+            "Adjust each forecast hour separately",
             value=True,
             disabled=not include_intervals,
-            help="Maintains a separate adaptive conformal state for each forecast lead time.",
+            help="Lets each hour use a forecast range based on its own recent errors.",
         )
         st.caption(
-            f"Diagnostics use {CALIBRATION_WINDOWS} calibration and "
-            f"{EVALUATION_WINDOWS} evaluation windows."
+            f"The accuracy check uses {CALIBRATION_WINDOWS} earlier forecasts to set the ranges "
+            f"and {EVALUATION_WINDOWS} recent forecasts to measure results."
         )
         if st.button("Clear dashboard cache", use_container_width=True):
             _load_artifact.clear()
