@@ -5,7 +5,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src.modeling.inference import _AdaptiveConformalCalibrator, _baseline_candidates
+from src.modeling.inference import _AdaptiveConformalCalibrator, _previous_day_baseline
+from src.modeling.lstm_pipeline import previous_day_baseline
 from src.processing.features import FORECAST_WEATHER_FEATURES, build_forecast_lead_features
 from src.processing.helpers import impute_load_causally, impute_weather
 
@@ -64,15 +65,21 @@ class ForecastWeatherTests(unittest.TestCase):
 
 
 class BenchmarkAndIntervalTests(unittest.TestCase):
-    def test_seasonal_baselines_use_only_known_history(self) -> None:
+    def test_previous_day_baseline_uses_only_known_history(self) -> None:
         values = np.arange(240, dtype=np.float32)
         anchors = np.asarray([200])
 
-        candidates = _baseline_candidates(values, anchors, horizon=4)
+        prediction = _previous_day_baseline(values, anchors, horizon=4)
 
-        np.testing.assert_array_equal(candidates["persistence"][0], [199, 199, 199, 199])
-        np.testing.assert_array_equal(candidates["seasonal_24h"][0], [176, 177, 178, 179])
-        np.testing.assert_array_equal(candidates["seasonal_168h"][0], [32, 33, 34, 35])
+        np.testing.assert_array_equal(prediction[0], [176, 177, 178, 179])
+
+        target = pd.Series(values, index=pd.date_range("2025-01-01", periods=240, freq="h"))
+        actual, training_prediction, issue_times = previous_day_baseline(
+            target, lookback=200, horizon=4
+        )
+        np.testing.assert_array_equal(training_prediction[0], [176, 177, 178, 179])
+        np.testing.assert_array_equal(actual[0], [200, 201, 202, 203])
+        self.assertEqual(issue_times[0], target.index[200])
 
     def test_aci_alpha_adapts_after_misses(self) -> None:
         calibrator = _AdaptiveConformalCalibrator(

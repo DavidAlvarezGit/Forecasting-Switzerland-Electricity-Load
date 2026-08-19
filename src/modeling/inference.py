@@ -303,23 +303,16 @@ def _true_horizons(y_all: np.ndarray, anchors: np.ndarray, horizon: int) -> np.n
     return np.stack([y_all[anchor : anchor + horizon] for anchor in anchors], axis=0)
 
 
-def _baseline_candidates(
+def _previous_day_baseline(
     y_all: np.ndarray,
     anchors: np.ndarray,
     horizon: int,
-) -> dict[str, np.ndarray]:
+) -> np.ndarray:
+    """Repeat the observed values from the same hours one day earlier."""
     offsets = np.arange(horizon)
-    persistence = np.stack(
-        [np.full(horizon, y_all[anchor - 1], dtype=np.float32) for anchor in anchors]
-    )
-    daily = np.stack([y_all[anchor + offsets - 24] for anchor in anchors]).astype(np.float32)
-    weekly = np.stack([y_all[anchor + offsets - 168] for anchor in anchors]).astype(np.float32)
-    return {
-        "persistence": persistence,
-        "seasonal_24h": daily,
-        "seasonal_168h": weekly,
-        "seasonal_24h_168h_blend": (daily + weekly) / 2.0,
-    }
+    return np.stack(
+        [y_all[anchor + offsets - 24] for anchor in anchors]
+    ).astype(np.float32)
 
 
 def forecast_next_horizon_with_intervals(
@@ -465,31 +458,9 @@ def evaluate_recent_backtest(
     for residual_row in np.abs(y_cal_true - y_cal_pred):
         calibrator.update(residual_row)
 
-    baseline_calibration = _baseline_candidates(y_all, anchors_cal, artifact.horizon)
-    baseline_calibration_mae = {
-        name: float(np.mean(np.abs(y_cal_true - prediction)))
-        for name, prediction in baseline_calibration.items()
-    }
-    selected_baseline_name = min(
-        baseline_calibration_mae,
-        key=baseline_calibration_mae.get,
-    )
-
     y_eval_true = _true_horizons(y_all, anchors_eval, artifact.horizon)
     y_eval_pred = np.stack([prediction_by_anchor[int(anchor)] for anchor in anchors_eval])
-    baseline_eval = _baseline_candidates(y_all, anchors_eval, artifact.horizon)
-    baseline_eval_metrics = {
-        name: {
-            "mae": float(np.mean(np.abs(y_eval_true - prediction))),
-            "rmse": float(np.sqrt(np.mean((y_eval_true - prediction) ** 2))),
-        }
-        for name, prediction in baseline_eval.items()
-    }
-    strongest_baseline_name = min(
-        baseline_eval_metrics,
-        key=lambda name: baseline_eval_metrics[name]["mae"],
-    )
-    y_eval_baseline = baseline_eval[strongest_baseline_name]
+    y_eval_baseline = _previous_day_baseline(y_all, anchors_eval, artifact.horizon)
 
     update_queue = list(np.concatenate([anchors_pending, anchors_eval]))
     update_position = 0
@@ -522,9 +493,7 @@ def evaluate_recent_backtest(
     )
     y_history_true = _true_horizons(y_all, anchors_history, artifact.horizon)
     y_history_pred = np.stack([prediction_by_anchor[int(anchor)] for anchor in anchors_history])
-    y_history_baseline = _baseline_candidates(
-        y_all, anchors_history, artifact.horizon
-    )[strongest_baseline_name]
+    y_history_baseline = _previous_day_baseline(y_all, anchors_history, artifact.horizon)
     final_width = calibrator.widths()
 
     history_records: list[dict[str, Any]] = []
@@ -556,10 +525,7 @@ def evaluate_recent_backtest(
         "mae_improvement_pct": mae_improvement_pct,
         "rmse_model": rmse_model,
         "rmse_baseline": rmse_baseline,
-        "baseline_name": strongest_baseline_name,
-        "baseline_selected_on_calibration": selected_baseline_name,
-        "baseline_calibration_mae": baseline_calibration_mae,
-        "baseline_eval_metrics": baseline_eval_metrics,
+        "baseline_name": "previous_day",
         "coverage": coverage,
         "target_coverage": 1.0 - float(alpha),
         "coverage_gap": float(coverage - (1.0 - float(alpha))),

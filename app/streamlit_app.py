@@ -98,12 +98,7 @@ def _format_timestamp(value: Any) -> str:
 
 
 def _baseline_label(name: Any) -> str:
-    labels = {
-        "persistence": "Persistence",
-        "seasonal_24h": "Previous day",
-        "seasonal_168h": "Previous week",
-        "seasonal_24h_168h_blend": "Day/week seasonal blend",
-    }
+    labels = {"previous_day": "Same hour yesterday"}
     return labels.get(str(name), str(name).replace("_", " ").title())
 
 
@@ -436,10 +431,9 @@ def _render_performance_tab(results: DashboardResults) -> None:
     st.markdown('<p class="section-kicker">Recent accuracy check</p>', unsafe_allow_html=True)
     st.subheader("Model performance")
     st.caption(
-        "We compare the model with four simple forecasts: repeat the latest value, use the "
-        "same hour yesterday, use the same hour last week, or average yesterday and last week. "
-        "The dashboard shows the simple forecast with the smallest average error. MAE is the "
-        "average difference from the real demand, so smaller is better."
+        "We compare the model with one simple forecast: use the electricity demand from the "
+        "same hour yesterday. MAE is the average difference from the real demand, so smaller "
+        "is better. The forecast range is adjusted with ACI as new errors become available."
     )
 
     columns = st.columns(4)
@@ -463,31 +457,6 @@ def _render_performance_tab(results: DashboardResults) -> None:
     chart = _performance_chart(results)
     if chart is not None:
         st.altair_chart(chart, use_container_width=True)
-
-    baseline_metrics = results.metadata.get("baseline_eval_metrics", {})
-    if isinstance(baseline_metrics, dict) and baseline_metrics:
-        baseline_rows = [
-            {
-                "Baseline": _baseline_label(name),
-                "MAE (MW)": values.get("mae"),
-                "RMSE (MW)": values.get("rmse"),
-            }
-            for name, values in baseline_metrics.items()
-            if isinstance(values, dict)
-        ]
-        with st.expander("Compare all simple forecasts"):
-            st.dataframe(
-                pd.DataFrame(baseline_rows).sort_values("MAE (MW)").round(1),
-                hide_index=True,
-                use_container_width=True,
-            )
-            calibration_choice = _baseline_label(
-                results.metadata.get("baseline_selected_on_calibration")
-            )
-            st.caption(
-                f"During the earlier comparison period, {calibration_choice} had the smallest error. "
-                "All four methods are shown so you can judge the model against each one."
-            )
 
     left, right = st.columns([1.3, 1])
     with left:

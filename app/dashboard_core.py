@@ -215,12 +215,6 @@ def build_dashboard_results(
             else "Adaptive ranges · shared across all forecast hours"
         ),
         "baseline_name": backtest.get("baseline_name", "unavailable") if backtest else "unavailable",
-        "baseline_selected_on_calibration": (
-            backtest.get("baseline_selected_on_calibration", "unavailable")
-            if backtest
-            else "unavailable"
-        ),
-        "baseline_eval_metrics": backtest.get("baseline_eval_metrics", {}) if backtest else {},
     }
 
     return DashboardResults(

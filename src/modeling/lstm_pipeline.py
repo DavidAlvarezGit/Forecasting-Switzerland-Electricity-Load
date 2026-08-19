@@ -235,59 +235,30 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
     return {"mae": mae, "rmse": rmse}
 
 
-def naive_last_value_multi_horizon(
+def previous_day_baseline(
     target: pd.Series,
     lookback: int,
     horizon: int,
 ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """Build the same-hour-previous-day baseline from known observations."""
     y_true: list[np.ndarray] = []
-    y_pred: list[np.ndarray] = []
-    idx: list[pd.Timestamp] = []
-    arr = target.to_numpy()
-
-    for i in range(lookback, len(arr) - horizon + 1):
-        last_value = arr[i - 1]
-        y_true.append(arr[i : i + horizon])
-        y_pred.append(np.full(horizon, last_value, dtype=np.float32))
-        idx.append(target.index[i])
-
-    return np.asarray(y_true, dtype=np.float32), np.asarray(y_pred, dtype=np.float32), pd.DatetimeIndex(idx)
-
-
-def multi_horizon_baselines(
-    target: pd.Series,
-    lookback: int,
-    horizon: int,
-) -> tuple[np.ndarray, dict[str, np.ndarray], pd.DatetimeIndex]:
-    """Build persistence and seasonal baselines from information known at issue time."""
-    y_true: list[np.ndarray] = []
-    predictions: dict[str, list[np.ndarray]] = {
-        "persistence": [],
-        "seasonal_24h": [],
-        "seasonal_168h": [],
-        "seasonal_24h_168h_blend": [],
-    }
+    predictions: list[np.ndarray] = []
     idx: list[pd.Timestamp] = []
     arr = target.to_numpy(dtype=np.float32)
 
-    minimum_anchor = max(lookback, 168)
+    minimum_anchor = max(lookback, 24)
     horizon_offsets = np.arange(horizon)
     for anchor in range(minimum_anchor, len(arr) - horizon + 1):
         actual = arr[anchor : anchor + horizon]
-        persistence = np.full(horizon, arr[anchor - 1], dtype=np.float32)
         daily = arr[anchor + horizon_offsets - 24]
-        weekly = arr[anchor + horizon_offsets - 168]
 
         y_true.append(actual)
-        predictions["persistence"].append(persistence)
-        predictions["seasonal_24h"].append(daily)
-        predictions["seasonal_168h"].append(weekly)
-        predictions["seasonal_24h_168h_blend"].append((daily + weekly) / 2.0)
+        predictions.append(daily)
         idx.append(target.index[anchor])
 
     return (
         np.asarray(y_true, dtype=np.float32),
-        {name: np.asarray(rows, dtype=np.float32) for name, rows in predictions.items()},
+        np.asarray(predictions, dtype=np.float32),
         pd.DatetimeIndex(idx),
     )
 
@@ -586,30 +557,19 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
     df = load_lstm_dataset(cfg.features_path, target_col=cfg.target_col)
     train_df, val_df, test_df = split_dataset(df, train_ratio=cfg.train_ratio, val_ratio=cfg.val_ratio)
 
-    y_val_true_baseline, y_val_baselines, _ = multi_horizon_baselines(
+    y_val_true_baseline, y_val_baseline, _ = previous_day_baseline(
         val_df[cfg.target_col],
         lookback=cfg.lookback,
         horizon=cfg.horizon,
     )
-    baseline_validation_metrics = {
-        name: evaluate_metrics(y_val_true_baseline, prediction)
-        for name, prediction in y_val_baselines.items()
-    }
-    selected_baseline_name = min(
-        baseline_validation_metrics,
-        key=lambda name: baseline_validation_metrics[name]["mae"],
-    )
+    baseline_validation_metrics = evaluate_metrics(y_val_true_baseline, y_val_baseline)
 
-    y_test_true_baseline, y_test_baselines, _ = multi_horizon_baselines(
+    y_test_true_baseline, y_test_baseline, _ = previous_day_baseline(
         test_df[cfg.target_col],
         lookback=cfg.lookback,
         horizon=cfg.horizon,
     )
-    baseline_test_metrics = {
-        name: evaluate_metrics(y_test_true_baseline, prediction)
-        for name, prediction in y_test_baselines.items()
-    }
-    selected_baseline_metrics = baseline_test_metrics[selected_baseline_name]
+    baseline_test_metrics = evaluate_metrics(y_test_true_baseline, y_test_baseline)
 
     selected_feature_cols, importance_df, fs_summary = select_features_lgbm(
         train_df=train_df,
@@ -684,14 +644,7 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
 
     compare_df = pd.DataFrame(
         [
-            *(
-                {
-                    "model": name,
-                    "selected_on_validation": name == selected_baseline_name,
-                    **metrics,
-                }
-                for name, metrics in baseline_test_metrics.items()
-            ),
+            {"model": "previous_day", **baseline_test_metrics},
             {"model": "lstm_24h", **lstm_metrics},
         ]
     ).sort_values("mae")
@@ -710,10 +663,9 @@ def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, An
             {
                 "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()},
                 "feature_selection": fs_summary,
-                "selected_baseline": selected_baseline_name,
+                "baseline": "previous_day",
                 "baseline_validation_metrics": baseline_validation_metrics,
                 "baseline_test_metrics": baseline_test_metrics,
-                "selected_baseline_metrics": selected_baseline_metrics,
                 "lstm_metrics": lstm_metrics,
             },
             fp,

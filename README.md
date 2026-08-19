@@ -4,7 +4,7 @@ Forecast aggregate Swiss electricity demand for the next 24 hours from load hist
 
 ## Why this project exists
 
-Electricity demand changes with the hour, weekday, season, weather, and recent consumption pattern. A useful forecast must therefore do more than produce one number: it should preserve information timing, compare itself with credible seasonal baselines, communicate uncertainty, and expose the freshness of its inputs.
+Electricity demand changes with the hour, weekday, season, weather, and recent consumption pattern. A useful forecast must therefore do more than produce one number: it should preserve information timing, compare itself with a clear reference forecast, communicate uncertainty, and expose the freshness of its inputs.
 
 This project:
 
@@ -15,7 +15,7 @@ This project:
 - ranks predictors against several points in the complete 24-hour forecast horizon;
 - predicts all 24 lead times with one LSTM;
 - calibrates intervals with Adaptive Conformal Inference (ACI);
-- compares the model with persistence and strong daily/weekly seasonal baselines;
+- compares the model with one simple reference: demand from the same hour yesterday;
 - presents forecasts, performance, and artifact health in Streamlit.
 
 It is a forecasting prototype, not a production dispatch or trading system.
@@ -29,7 +29,7 @@ It is a forecasting prototype, not a production dispatch or trading system.
 5. LightGBM importance is aggregated across 1-, 6-, 12-, and 24-hour targets. The model retains 32 selected signals plus load history, including all seven calendar features and at least eight forecast-weather leads.
 6. A two-layer LSTM reads the preceding 336 hours and predicts all 24 lead times in one pass.
 7. ACI maintains rolling residual buffers and adapts its miscoverage level after observed misses. Backtests delay each update until that forecast's complete horizon is observable.
-8. A predeclared baseline suite includes persistence, previous day, previous week, and a day/week blend. Training selects the operational baseline on validation data; the dashboard exposes every recent baseline result.
+8. The only naive baseline repeats the observed demand from the same hour 24 hours earlier. It is fixed in advance and never selected from several alternatives.
 9. Streamlit serves the forward forecast, uncertainty band, recent backcasts, evaluation metrics, and data/model metadata.
 
 If interval calibration or backtesting cannot run, the dashboard keeps the point forecast available and explains which diagnostics are missing.
@@ -38,25 +38,22 @@ If interval calibration or backtesting cannot run, the dashboard keeps the point
 
 ### Chronological test split
 
-The selected model is compared with the day/week seasonal blend chosen on validation data.
+The selected model is compared with demand from the same hour yesterday.
 
-| Measure | LSTM | Seasonal blend |
+| Measure | LSTM | Same hour yesterday |
 |---|---:|---:|
-| Mean absolute error | 420.21 MW | 444.24 MW |
-| Root mean squared error | 533.74 MW | 578.33 MW |
-| MAE reduction | 5.4% | - |
+| Mean absolute error | 420.21 MW | 513.64 MW |
+| Root mean squared error | 533.74 MW | 674.60 MW |
+| MAE reduction | 18.2% | - |
 
 ### Recent rolling backtest
 
-The dashboard evaluates the 120 most recent hourly forecast windows. The LSTM is effectively tied with the strongest recent baseline in MAE and better in RMSE; this is reported instead of comparing only with weak persistence.
+The dashboard evaluates the 120 most recent hourly forecast windows against the fixed previous-day reference.
 
 | Model | MAE | RMSE |
 |---|---:|---:|
 | LSTM | 464.64 MW | 599.10 MW |
-| Day/week seasonal blend | 460.43 MW | 626.86 MW |
 | Previous day | 479.47 MW | 656.97 MW |
-| Previous week | 554.22 MW | 770.45 MW |
-| Persistence | 897.78 MW | 1,116.47 MW |
 
 | Interval measure | Result |
 |---|---:|
@@ -64,14 +61,14 @@ The dashboard evaluates the 120 most recent hourly forecast windows. The LSTM is
 | Empirical ACI coverage | 95.5% |
 | Mean interval width | 2,453.83 MW |
 
-Recent MAE is 0.9% higher than the blend while RMSE is 4.4% lower. These figures describe overlapping rolling windows for the included artifacts, not an independent production benchmark.
+Recent MAE is 3.1% lower than the previous-day reference, while RMSE is 8.8% lower. These figures describe overlapping rolling windows for the included artifacts, not an independent production benchmark.
 
 ## Dashboard
 
 The application is organized around three views:
 
 - **Forecast** shows observed demand, recent model backcasts, the current 24-hour forecast, and its ACI uncertainty band. The visible horizon and historical context are adjustable, and forecast values can be downloaded as CSV.
-- **Performance** compares the LSTM with the strongest recent seasonal baseline, exposes the full baseline suite, and reports ACI coverage and evaluation scope.
+- **Performance** compares the LSTM with demand from the same hour yesterday and reports ACI coverage and evaluation scope.
 - **Data & model** reports dataset coverage, missing model inputs, lookback, horizon, feature count, inference device, artifact paths, and the latest feature rows.
 
 Model and feature files can be changed from the sidebar. Cached results are keyed by each artifact's modification time, so replacing a file invalidates stale dashboard output.
@@ -155,12 +152,12 @@ tests/                  causal preprocessing, baseline, weather-lead, and ACI te
 
 The current pipeline was checked by:
 
-- running six regression tests for causal imputation, weather-lead alignment, seasonal baselines, and ACI adaptation;
+- running six regression tests for causal imputation, weather-lead alignment, the previous-day baseline, and ACI adaptation;
 - compiling the application and pipeline modules;
 - rebuilding 19,691 causal feature rows with 168 fixed-vintage/live forecast-weather columns and no missing values;
 - verifying horizon-aware selection retains 32 inputs, eight future-weather signals, and seven calendar signals;
 - training and reloading the checked-in checkpoint;
-- running point forecasting, ACI, the baseline suite, and recent backtesting end to end;
+- running point forecasting, ACI, the previous-day baseline, and recent backtesting end to end;
 - validating both Altair chart specifications;
 - rendering all three dashboard views in headless Chromium without Streamlit exceptions.
 

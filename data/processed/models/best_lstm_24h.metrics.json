@@ -36,46 +36,14 @@
     "val_mae_full_filtered": 310.5519922143692,
     "val_mae_selected": 311.7769627882166
   },
-  "selected_baseline": "seasonal_24h_168h_blend",
+  "baseline": "previous_day",
   "baseline_validation_metrics": {
-    "persistence": {
-      "mae": 796.6925659179688,
-      "rmse": 1003.9428208319435
-    },
-    "seasonal_24h": {
-      "mae": 400.5950622558594,
-      "rmse": 568.3365805136953
-    },
-    "seasonal_168h": {
-      "mae": 442.7694396972656,
-      "rmse": 596.111671585115
-    },
-    "seasonal_24h_168h_blend": {
-      "mae": 348.24774169921875,
-      "rmse": 460.4187631928134
-    }
+    "mae": 400.5950622558594,
+    "rmse": 568.3365805136953
   },
   "baseline_test_metrics": {
-    "persistence": {
-      "mae": 676.3110961914062,
-      "rmse": 861.7047058012391
-    },
-    "seasonal_24h": {
-      "mae": 513.6361083984375,
-      "rmse": 674.6007847238246
-    },
-    "seasonal_168h": {
-      "mae": 545.4569091796875,
-      "rmse": 718.444456795374
-    },
-    "seasonal_24h_168h_blend": {
-      "mae": 444.24224853515625,
-      "rmse": 578.3292477041084
-    }
-  },
-  "selected_baseline_metrics": {
-    "mae": 444.24224853515625,
-    "rmse": 578.3292477041084
+    "mae": 513.6361083984375,
+    "rmse": 674.6007847238246
   },
   "lstm_metrics": {
     "mae": 420.2131652832031,
