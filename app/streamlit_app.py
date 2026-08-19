@@ -23,6 +23,7 @@ DEFAULT_FEATURES_PATH = "data/processed/lstm_features.parquet"
 CALIBRATION_WINDOWS = 120
 EVALUATION_WINDOWS = 120
 HISTORY_WINDOWS = 336
+RESULTS_CACHE_VERSION = 2
 
 SWISS_RED = "#D52B1E"
 INK = "#18212B"
@@ -54,7 +55,9 @@ def _compute_results(
     confidence: float,
     per_horizon: bool,
     include_intervals: bool,
+    cache_version: int,
 ) -> DashboardResults:
+    del cache_version
     artifact = _load_artifact(model_path, model_modified_ns)
     df = _load_features(features_path, features_modified_ns)
     return build_dashboard_results(
@@ -98,8 +101,8 @@ def _format_timestamp(value: Any) -> str:
 
 
 def _baseline_label(name: Any) -> str:
-    labels = {"previous_day": "Same hour yesterday"}
-    return labels.get(str(name), str(name).replace("_", " ").title())
+    del name
+    return "Same hour yesterday"
 
 
 def _inject_styles() -> None:
@@ -616,6 +619,7 @@ def main() -> None:
                 confidence,
                 per_horizon,
                 include_intervals,
+                RESULTS_CACHE_VERSION,
             )
         except Exception as exc:
             st.error("Forecast generation failed.")

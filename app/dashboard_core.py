@@ -214,7 +214,8 @@ def build_dashboard_results(
             if per_horizon
             else "Adaptive ranges · shared across all forecast hours"
         ),
-        "baseline_name": backtest.get("baseline_name", "unavailable") if backtest else "unavailable",
+        # The project intentionally uses one fixed reference forecast.
+        "baseline_name": "previous_day",
     }
 
     return DashboardResults(

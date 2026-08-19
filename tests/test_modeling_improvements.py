@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from app.streamlit_app import _baseline_label
 from src.modeling.inference import _AdaptiveConformalCalibrator, _previous_day_baseline
 from src.modeling.lstm_pipeline import previous_day_baseline
 from src.processing.features import FORECAST_WEATHER_FEATURES, build_forecast_lead_features
@@ -65,6 +66,10 @@ class ForecastWeatherTests(unittest.TestCase):
 
 
 class BenchmarkAndIntervalTests(unittest.TestCase):
+    def test_dashboard_always_names_the_fixed_baseline(self) -> None:
+        self.assertEqual(_baseline_label(None), "Same hour yesterday")
+        self.assertEqual(_baseline_label("unavailable"), "Same hour yesterday")
+
     def test_previous_day_baseline_uses_only_known_history(self) -> None:
         values = np.arange(240, dtype=np.float32)
         anchors = np.asarray([200])
