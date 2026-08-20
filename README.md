@@ -1,135 +1,194 @@
 # Switzerland Electricity Load Forecasting
 
-Forecast Switzerland's aggregate electricity demand every hour for the following 24 hours. The project combines ENTSO-E load history with point-in-time ECMWF weather forecasts, evaluates two transparent seasonal baselines and an LSTM on hourly rolling origins, calibrates adaptive uncertainty ranges, and presents the results in Streamlit.
+End-to-end **24-hour electricity demand forecasting for Switzerland** using ENTSO-E load data, archived weather forecasts, a multi-horizon LSTM, and adaptive conformal prediction.
 
-## Why this project exists
+The project is designed to reproduce a realistic forecasting setting: every historical prediction uses only information that would have been available at the forecast origin.
 
-An electricity forecast can look excellent while using information that would not have existed when the forecast was issued. Common failure modes include selecting weather values by target time instead of forecast run, filling missing history from future observations, and tuning uncertainty ranges on the final test period.
+On the final held-out test period, the LSTM achieves **436.8 MW MAE**, improving on the previous-day baseline by **15.4%**. Adaptive conformal intervals achieve **89.5% empirical coverage for a 90% target**.
 
-This project makes the forecast contract explicit:
-
-- one new forecast origin is created for every real UTC hour;
-- every issue predicts exactly `t+1` through `t+24`;
-- daylight-saving changes produce the correct 23- or 25-hour local day while UTC remains continuous;
-- each origin uses one complete weather-model run available before issuance;
-- missing load is filled only from older observations;
-- all scalers and model choices are learned before the final test period;
-- uncertainty settings are selected on validation data and updated only after outcomes are observable.
-
-## How it works
+## Architecture
 
 ```text
-ENTSO-E load + archived ECMWF forecast runs
+ENTSO-E load + archived weather forecasts
                     |
                     v
-       point-in-time and DST validation
+          incremental ingestion
                     |
                     v
-          one sample per real hour
+       point-in-time validation
                     |
                     v
-   previous-day | previous-week | LSTM
+        causal feature pipeline
                     |
                     v
-       hourly rolling-origin evaluation
+     seasonal baselines + LSTM
                     |
                     v
- adaptive conformal forecast ranges (ACI)
+      rolling-origin backtest
                     |
                     v
-             Streamlit dashboard
+ adaptive conformal prediction
+                    |
+                    v
+          Streamlit dashboard
 ```
 
-The primary weather input is the archived operational forecast data from Open-Meteo's [Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api). These archived snapshots preserve the forecast values that were available at each historical run, so they can be used for point-in-time model training. Each hourly origin selects the newest archived run available by that origin and uses only its first 24 forecast leads. It never replaces a missing vintage with a later forecast.
+## Forecasting setup
 
-## Model inputs
+A new forecast is produced at every UTC hour.
 
-There is no LightGBM ranking step and no top-five cutoff. The LSTM uses every declared production input:
+Each forecast origin `t` predicts:
 
-| Input group | Inputs |
-|---|---:|
-| Load sequence | 336 hourly values ending at the forecast origin |
-| Load context | 24-hour and 168-hour lags, means, and standard deviations |
-| Forecast weather | 5 variables x 24 future leads = 120 values |
-| Calendar | hour, weekday, and annual cycles plus a weekend flag |
-| LSTM output | 24 hourly load values |
+```text
+t+1, t+2, ..., t+24
+```
 
-The weather variables are temperature, relative humidity, precipitation, cloud cover, and wind speed, averaged across ten Swiss locations. This retains all relevant forecast-weather and seasonality inputs while keeping the feature contract explicit and reproducible.
+The pipeline uses chronological train, validation, and test periods. Future observations are excluded from preprocessing, model selection, calibration, and evaluation.
+
+Weather features are also point-in-time: each historical forecast uses an archived weather-model run available before the corresponding forecast origin.
+
+## Data
+
+### Electricity load
+
+Swiss aggregate electricity demand is collected from the **ENTSO-E Transparency Platform**.
+
+### Weather
+
+Historical forecast vintages are obtained through the **Open-Meteo Historical Forecast API**.
+
+Five weather variables are aggregated across ten Swiss locations:
+
+* temperature;
+* relative humidity;
+* precipitation;
+* cloud cover;
+* wind speed.
+
+For each forecast origin, the model receives the next 24 forecast values for each weather variable.
+
+## Model
+
+The forecasting model is a **multi-horizon PyTorch LSTM** predicting all 24 future hours in one pass.
+
+Inputs include:
+
+| Feature group     |                                     Inputs |
+| ----------------- | -----------------------------------------: |
+| Load history      |                         Previous 336 hours |
+| Load context      |   24h and 168h lags and rolling statistics |
+| Weather forecasts |                     5 variables × 24 leads |
+| Calendar          | Hour, weekday, annual cycles, weekend flag |
+| Output            |                 24 hourly demand forecasts |
+
+Two transparent seasonal baselines are evaluated alongside the LSTM:
+
+* same hour one day earlier;
+* same hour one week earlier.
+
+## Evaluation
+
+The project uses an **hourly rolling-origin backtest** rather than a random train/test split.
+
+At each historical forecast origin, the system:
+
+1. constructs features using only currently available information;
+2. generates a 24-hour forecast;
+3. compares predictions with future observations;
+4. updates adaptive uncertainty calibration only after the relevant targets become observable.
+
+### Data splits
+
+| Split      | Forecast origins | Period                    |
+| ---------- | ---------------: | ------------------------- |
+| Train      |           12,793 | 14 Jan 2024 – 30 Jun 2025 |
+| Validation |            4,416 | 1 Jul 2025 – 31 Dec 2025  |
+| Final test |            2,590 | 1 Jan 2026 – 18 Apr 2026  |
 
 ## Results
 
-The bundled artifact is the hourly version used by the dashboard. It contains 19,799 hourly origins and was trained with early stopping on the chronological training split.
+### Final-test performance
 
-### Chronological evaluation
+| Model         |           MAE |          RMSE |
+| ------------- | ------------: | ------------: |
+| **LSTM**      | **436.77 MW** | **553.80 MW** |
+| Previous day  |     516.29 MW |     676.73 MW |
+| Previous week |     543.98 MW |     717.57 MW |
 
-| Split | Hourly origins | Period |
-|---|---:|---|
-| Train | 12,793 | 14 Jan 2024 - 30 Jun 2025 |
-| Validation | 4,416 | 1 Jul 2025 - 31 Dec 2025 |
-| Final test | 2,590 | 1 Jan 2026 - 18 Apr 2026 |
+Compared with the strongest seasonal baseline, the LSTM reduces:
 
-The model is trained on the train split. Early stopping and adaptive conformal settings use validation only. The final-test outcomes are untouched until the figures below are calculated.
+* **MAE by 15.4%**
+* **RMSE by 18.2%**
 
-| Forecast | MAE | RMSE |
-|---|---:|---:|
-| LSTM | **436.77 MW** | **553.80 MW** |
-| Same hour yesterday | 516.29 MW | 676.73 MW |
-| Same hour last week | 543.98 MW | 717.57 MW |
+### Performance by forecast horizon
 
-Against the previous-day baseline, the LSTM reduces MAE by 15.4% and RMSE by 18.2% on the final test.
+| Hours ahead |      LSTM MAE | Previous day | Previous week |
+| ----------: | ------------: | -----------: | ------------: |
+|           1 | **382.54 MW** |    515.92 MW |     544.47 MW |
+|           6 | **425.25 MW** |    516.63 MW |     544.97 MW |
+|          12 | **434.94 MW** |    515.95 MW |     544.25 MW |
+|          24 | **449.35 MW** |    516.15 MW |     542.59 MW |
 
-### Error by forecast lead
+Reporting errors by lead makes performance degradation across the 24-hour horizon visible rather than hiding it inside one aggregate metric.
 
-| Hours ahead | LSTM MAE | Yesterday MAE | Last week MAE |
-|---:|---:|---:|---:|
-| 1 | **382.54 MW** | 515.92 MW | 544.47 MW |
-| 6 | **425.25 MW** | 516.63 MW | 544.97 MW |
-| 12 | **434.94 MW** | 515.95 MW | 544.25 MW |
-| 24 | **449.35 MW** | 516.15 MW | 542.59 MW |
+## Uncertainty quantification
 
-The LSTM does not win every lead: yesterday's value is stronger at lead 12. Reporting the horizon separately makes that weakness visible instead of hiding it inside one average.
+Forecasts are complemented with **Adaptive Conformal Inference (ACI)** prediction intervals targeting 90% coverage.
 
-### Adaptive forecast range
+ACI hyperparameters are selected on the validation period only.
 
-Adaptive Conformal Inference (ACI) targets 90% coverage. Its update rate, memory window, and per-lead configuration are selected on validation only. A residual enters the calibrator only when its explicit `target_end_utc` is less than or equal to the current forecast origin. This matters for overlapping hourly forecasts and for the 23-hour spring daylight-saving day.
+Because hourly 24-step forecasts overlap, calibration residuals are added only when their targets have actually become observable.
 
-| Measure | Final-test result |
-|---|---:|
-| Target coverage | 90.0% |
-| Observed coverage | 89.5% |
-| Mean full range width | 1,817.39 MW |
-| Selected memory | 168 hourly residuals |
-| Per-lead calibration | No |
-
-All 24 lead-specific errors, coverage values, interval widths, selected settings, split dates, and training metadata are published in [`daily_lstm_24h.metrics.json`](data/processed/models/daily_lstm_24h.metrics.json).
+| Metric              |    Final test |
+| ------------------- | ------------: |
+| Target coverage     |         90.0% |
+| Observed coverage   |         89.5% |
+| Mean interval width |   1,817.39 MW |
+| Calibration memory  | 168 residuals |
 
 ## Dashboard
 
-The Streamlit application has three views:
+A Streamlit application provides three views:
 
-- **Forecast** shows the latest archived 24-hour issue, observed context, point forecast, uncertainty range, and CSV export.
-- **Performance** compares the LSTM with yesterday and last week, including results at leads 1, 6, 12, and 24.
-- **Data & model** exposes forecast origins, split counts, weather run and availability metadata, feature counts, model version, and artifact paths.
+**Forecast** — latest 24-hour prediction, observed history, and uncertainty intervals.
 
-Dashboard wording uses plain language; ACI remains named in the technical audit. Model and sample caches are keyed by file modification time, so replacing an artifact invalidates stale results.
+**Performance** — comparison between the LSTM and seasonal baselines across the forecast horizon.
+
+**Data & model** — model configuration, split information, feature metadata, and forecasting artifacts.
+
+## Engineering
+
+The project includes:
+
+* incremental ENTSO-E and weather ingestion;
+* Parquet-based data storage;
+* causal preprocessing and feature generation;
+* DST-safe UTC forecasting;
+* model artifact persistence;
+* deterministic unit tests;
+* Ruff linting;
+* GitHub Actions continuous integration;
+* Streamlit deployment interface.
+
+The test suite checks the forecasting contract, including target alignment, weather-vintage availability, causal load imputation, baseline alignment, 24-step model output, and delayed conformal updates.
 
 ## Run locally
 
 Requirements:
 
-- Python 3.12
-- Poetry
+```text
+Python 3.12
+Poetry
+```
+
+Install dependencies and launch the dashboard:
 
 ```powershell
 poetry install --with dev
 poetry run python -m streamlit run app/streamlit_app.py
 ```
 
-The bundled sample table and trained model under `data/processed/` allow the dashboard to run without downloading raw data or retraining. Version-3 daily artifacts remain compatible; a rebuilt version-4 artifact identifies itself as hourly and updates the dashboard labels automatically.
-
-## Rebuild data and model
-
-Create a root `.env` file with an [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) API key:
+To rebuild the data and model, add an ENTSO-E API key to `.env`:
 
 ```env
 ENTSOE_API_KEY=your_api_key_here
@@ -144,49 +203,15 @@ poetry run python -m src.processing.processing
 poetry run python -m src.modeling.train_lstm
 ```
 
-Raw ENTSO-E partitions, weather runs, and ingestion state are incremental and rebuildable. The weather job checkpoints every 25 origins and retries individual failed dates, so one upstream error does not discard a long archive run.
-
-## Tests and continuous integration
-
-```powershell
-poetry run ruff check app src tests
-poetry run python -m unittest discover -s tests -v
-```
-
-The deterministic tests cover:
-
-- hourly origins across 23- and 25-hour daylight-saving days;
-- weather-run availability and rejection of late vintages;
-- exact `t+1` to `t+24` target alignment;
-- causal load imputation;
-- explicit previous-day and previous-week baseline alignment;
-- per-lead metrics and 24-value model output;
-- adaptive conformal updates only after `target_end_utc <= forecast_origin_utc`.
-
-GitHub Actions installs the Poetry lock, checks project metadata, runs Ruff, and executes the synthetic unit suite. CI does not download the full datasets or train the model.
-
 ## Project structure
 
 ```text
-app/                    Streamlit presentation and dashboard orchestration
-src/forecast_config.py  forecast origin, horizon, splits, weather, ACI, and paths
-src/ingestion/          ENTSO-E and point-in-time weather-run ingestion
-src/processing/         causal hourly sample construction
-src/modeling/           LSTM, baselines, rolling metrics, ACI, and inference
-data/processed/         compact dashboard samples, model, and measured metrics
-tests/                  deterministic forecasting-contract tests
-.github/workflows/      dependency, lint, and unit-test CI
+app/                    Streamlit dashboard
+src/ingestion/          ENTSO-E and weather ingestion
+src/processing/         point-in-time feature pipeline
+src/modeling/           LSTM, baselines, evaluation and ACI
+data/processed/         model artifacts and dashboard data
+tests/                  deterministic unit tests
+.github/workflows/      continuous integration
 ```
 
-## Current limits
-
-Before production use, the project would need:
-
-- a scheduler that collects each weather run and publishes each hourly issue in real time;
-- monitoring for missing feeds, delayed ENTSO-E observations, revisions, and forecast drift;
-- an operationally verified weather-publication service-level agreement instead of the conservative six-hour assumption;
-- a longer evaluation history covering more weather and demand regimes;
-- regional load or richer holiday/event inputs if they become reliably available at issuance;
-- scheduled retraining, artifact versioning, rollback, and alerting.
-
-The bundled dashboard is therefore an auditable archived evaluation, not a claim of a live production service.
