@@ -255,6 +255,12 @@ def load_weather_runs(config: ForecastConfig = DEFAULT_CONFIG) -> pd.DataFrame:
         "retrieved_at_utc",
     ):
         data[column] = pd.to_datetime(data[column], utc=True)
+    # Recompute the lead from the authoritative run/target timestamps. Older
+    # checkpoints wrote a lead relative to the forecast origin, which made the
+    # vintage validation fail even though the target timestamps were correct.
+    data["forecast_lead_hour"] = (
+        (data["target_timestamp_utc"] - data["weather_run_utc"]) / pd.Timedelta(hours=1)
+    ).astype("int16")
     scheduled_run = data["forecast_origin_utc"].dt.normalize() + pd.Timedelta(
         hours=config.weather_run_hour_utc
     )

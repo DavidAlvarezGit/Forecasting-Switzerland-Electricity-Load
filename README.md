@@ -103,6 +103,7 @@ At each historical forecast origin, the system:
 ## Results
 
 ### Final-test performance
+The bundled artifact is the hourly version used by the dashboard. It contains 19,918 hourly origins (including 119 newer live-forecast origins) and was trained with early stopping on the chronological training split.
 
 | Model         |           MAE |          RMSE |
 | ------------- | ------------: | ------------: |

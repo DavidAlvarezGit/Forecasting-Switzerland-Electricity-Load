@@ -322,13 +322,26 @@ def run_feature_pipeline(
     )
     if historical_paths:
         weather = pd.concat((pd.read_parquet(path) for path in historical_paths), ignore_index=True)
+        samples = build_hourly_forecast_samples(load, imputed, weather, config)
+
+        # The continuous historical archive is the training source. When a
+        # newer point-in-time model-run checkpoint exists, append only origins
+        # beyond that archive so live refreshes do not regress to its end date.
+        recent_runs = load_weather_runs(config)
+        if not recent_runs.empty:
+            recent_runs = recent_runs[recent_runs["forecast_origin_utc"] > samples.index.max()]
+            if not recent_runs.empty:
+                recent_samples = build_hourly_forecast_samples(load, imputed, recent_runs, config)
+                samples = pd.concat(
+                    [samples.drop(index=samples.index.intersection(recent_samples.index)), recent_samples]
+                ).sort_index()
     else:
         weather = load_weather_runs(config)
-    if weather.empty:
-        raise FileNotFoundError(
-            "No weather forecast runs found. Run `python -m src.ingestion.openmeteo` first."
-        )
-    samples = build_hourly_forecast_samples(load, imputed, weather, config)
+        if weather.empty:
+            raise FileNotFoundError(
+                "No weather forecast runs found. Run `python -m src.ingestion.openmeteo` first."
+            )
+        samples = build_hourly_forecast_samples(load, imputed, weather, config)
     resolved = Path(output_path) if output_path is not None else config.features_path
     resolved.parent.mkdir(parents=True, exist_ok=True)
     samples.to_parquet(resolved)
