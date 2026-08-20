@@ -1,6 +1,6 @@
 # Switzerland Electricity Load Forecasting
 
-End-to-end **24-hour electricity demand forecasting for Switzerland** using ENTSO-E load data, archived weather forecasts, a multi-horizon LSTM, and adaptive conformal prediction.
+End-to-end **24-hour electricity demand forecasting for Switzerland** using load data, weather forecasts, a multi-horizon LSTM, and adaptive conformal prediction (prediction intervals).
 
 The project is designed to reproduce a realistic forecasting setting: every historical prediction uses only information that would have been available at the forecast origin.
 
@@ -45,8 +45,6 @@ t+1, t+2, ..., t+24
 
 The pipeline uses chronological train, validation, and test periods. Future observations are excluded from preprocessing, model selection, calibration, and evaluation.
 
-Weather features are also point-in-time: each historical forecast uses an archived weather-model run available before the corresponding forecast origin.
-
 ## Data
 
 ### Electricity load
@@ -55,7 +53,7 @@ Swiss aggregate electricity demand is collected from the **ENTSO-E Transparency 
 
 ### Weather
 
-Historical forecast vintages are obtained through the **Open-Meteo Historical Forecast API**.
+Historical forecasts are obtained through the **Open-Meteo Historical Forecast API**.
 
 Five weather variables are aggregated across ten Swiss locations:
 
@@ -155,22 +153,6 @@ A Streamlit application provides three views:
 **Performance** — comparison between the LSTM and seasonal baselines across the forecast horizon.
 
 **Data & model** — model configuration, split information, feature metadata, and forecasting artifacts.
-
-## Engineering
-
-The project includes:
-
-* incremental ENTSO-E and weather ingestion;
-* Parquet-based data storage;
-* causal preprocessing and feature generation;
-* DST-safe UTC forecasting;
-* model artifact persistence;
-* deterministic unit tests;
-* Ruff linting;
-* GitHub Actions continuous integration;
-* Streamlit deployment interface.
-
-The test suite checks the forecasting contract, including target alignment, weather-vintage availability, causal load imputation, baseline alignment, 24-step model output, and delayed conformal updates.
 
 ## Run locally
 
