@@ -615,7 +615,7 @@
     "dropout": 0.15,
     "patience": 5,
     "weight_decay": 0.0001,
-    "model_out_path": "D:\\Projects\\Forecasting-Switzerland-Electricity-Load\\data\\processed\\models\\daily_lstm_24h.pt",
+    "model_out_path": "D:\\Projects\\Forecasting-Switzerland-Electricity-Load\\data\\processed\\models\\lstm_24h.pt",
     "epochs_completed": 16,
     "best_validation_mae_scaled": 0.3571383564368538,
     "device": "cuda"

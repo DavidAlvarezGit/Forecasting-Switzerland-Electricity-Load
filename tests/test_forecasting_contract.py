@@ -15,7 +15,7 @@ from src.modeling.evaluation import (
     seasonal_baselines,
 )
 from src.processing.features import (
-    build_daily_forecast_samples,
+    build_hourly_forecast_samples,
     impute_load_causally,
     validate_weather_vintages,
 )
@@ -84,7 +84,7 @@ class PointInTimeWeatherTests(unittest.TestCase):
         imputed = pd.Series(0, index=index, dtype="int8")
         weather = self._weather(origin, config)
 
-        samples = build_daily_forecast_samples(load, imputed, weather, config)
+        samples = build_hourly_forecast_samples(load, imputed, weather, config)
 
         self.assertIn(origin, samples.index)
         self.assertEqual(samples.loc[origin]["target_load_lead_01"], load.loc[origin + pd.Timedelta(hours=1)])

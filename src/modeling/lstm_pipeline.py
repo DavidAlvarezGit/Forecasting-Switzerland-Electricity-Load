@@ -35,7 +35,7 @@ class LSTMTrainConfig:
     model_out_path: Path = DEFAULT_CONFIG.model_path
 
 
-class DailyLoadLSTM(nn.Module):
+class LoadLSTM(nn.Module):
     """Encode load history with an LSTM, then combine it with known-at-origin context."""
 
     def __init__(
@@ -72,9 +72,9 @@ def set_deterministic_seed(seed: int) -> None:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-def load_daily_samples(path: Path, config: ForecastConfig = DEFAULT_CONFIG) -> pd.DataFrame:
+def load_forecast_samples(path: Path, config: ForecastConfig = DEFAULT_CONFIG) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(f"Daily sample table not found: {path}")
+        raise FileNotFoundError(f"Forecast sample table not found: {path}")
     samples = pd.read_parquet(path)
     if not isinstance(samples.index, pd.DatetimeIndex):
         samples.index = pd.to_datetime(samples.index, utc=True)
@@ -87,7 +87,7 @@ def load_daily_samples(path: Path, config: ForecastConfig = DEFAULT_CONFIG) -> p
     }
     missing = sorted(required.difference(samples.columns))
     if missing:
-        raise ValueError(f"Daily sample table is missing columns: {missing[:10]}")
+        raise ValueError(f"Forecast sample table is missing columns: {missing[:10]}")
     return samples
 
 
@@ -197,7 +197,7 @@ def run_training_pipeline(
 ) -> dict[str, Any]:
     cfg = train_config or LSTMTrainConfig()
     set_deterministic_seed(forecast_config.random_seed)
-    samples = load_daily_samples(forecast_config.features_path, forecast_config)
+    samples = load_forecast_samples(forecast_config.features_path, forecast_config)
     train = samples[samples["split"] == "train"]
     validation = samples[samples["split"] == "validation"]
     final_test = samples[samples["split"] == "final_test"]
@@ -235,7 +235,7 @@ def run_training_pipeline(
         False,
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = DailyLoadLSTM(
+    model = LoadLSTM(
         context_size=len(forecast_config.context_columns),
         horizon=forecast_config.horizon_hours,
         hidden_size=cfg.hidden_size,

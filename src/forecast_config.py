@@ -43,10 +43,10 @@ class ForecastConfig:
     aci_window_candidates: tuple[int, ...] = (7 * 24, 30 * 24, 60 * 24)
     aci_per_horizon_candidates: tuple[bool, ...] = (True, False)
 
-    features_path: Path = PROJECT_ROOT / "data" / "processed" / "daily_forecast_samples.parquet"
+    features_path: Path = PROJECT_ROOT / "data" / "processed" / "forecast_samples.parquet"
     weather_runs_path: Path = PROJECT_ROOT / "data" / "raw" / "weather_forecast_runs"
-    model_path: Path = PROJECT_ROOT / "data" / "processed" / "models" / "daily_lstm_24h.pt"
-    metrics_path: Path = PROJECT_ROOT / "data" / "processed" / "models" / "daily_lstm_24h.metrics.json"
+    model_path: Path = PROJECT_ROOT / "data" / "processed" / "models" / "lstm_24h.pt"
+    metrics_path: Path = PROJECT_ROOT / "data" / "processed" / "models" / "lstm_24h.metrics.json"
 
     @property
     def target_columns(self) -> tuple[str, ...]:

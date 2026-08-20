@@ -16,12 +16,12 @@ from src.modeling.evaluation import (
     rolling_aci_intervals,
     seasonal_baselines,
 )
-from src.modeling.lstm_pipeline import DailyLoadLSTM
+from src.modeling.lstm_pipeline import LoadLSTM
 
 
 @dataclass(slots=True)
 class LoadedLSTMArtifact:
-    model: DailyLoadLSTM
+    model: LoadLSTM
     history_columns: list[str]
     context_columns: list[str]
     target_columns: list[str]
@@ -64,7 +64,7 @@ def load_lstm_artifact(
 
     context_columns = list(checkpoint["context_columns"])
     target_columns = list(checkpoint["target_columns"])
-    model = DailyLoadLSTM(
+    model = LoadLSTM(
         context_size=len(context_columns),
         horizon=len(target_columns),
         hidden_size=int(checkpoint["hidden_size"]),

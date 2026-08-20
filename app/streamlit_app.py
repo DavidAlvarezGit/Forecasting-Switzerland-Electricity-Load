@@ -17,8 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.dashboard_core import DashboardResults, build_dashboard_results  # noqa: E402
 from src.modeling import inference as inference_mod  # noqa: E402
 
-DEFAULT_MODEL_PATH = "data/processed/models/daily_lstm_24h.pt"
-DEFAULT_FEATURES_PATH = "data/processed/daily_forecast_samples.parquet"
+DEFAULT_MODEL_PATH = "data/processed/models/lstm_24h.pt"
+DEFAULT_FEATURES_PATH = "data/processed/forecast_samples.parquet"
 EVALUATION_ORIGINS = 120 * 24
 HISTORY_ORIGINS = 30 * 24
 RESULTS_CACHE_VERSION = 4
