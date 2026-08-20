@@ -9,7 +9,7 @@ On the final held-out test period, the LSTM achieves **436.8 MW MAE**, improving
 ## Architecture
 
 ```text
-ENTSO-E load +  weather forecasts
+      ENTSO-E load +  weather forecasts
                     |
                     v
           incremental ingestion
