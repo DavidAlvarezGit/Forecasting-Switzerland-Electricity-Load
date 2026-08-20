@@ -148,7 +148,12 @@ def _summary(results: DashboardResults) -> None:
 
 def _forecast_chart(results: DashboardResults, context_hours: int) -> alt.LayerChart:
     forecast = results.forecast.reset_index(names="timestamp")
-    actual = results.recent_actual.tail(context_hours).rename("load_mw").reset_index(names="timestamp")
+    actual = (
+        results.recent_actual.tail(context_hours)
+        .rename("load_mw")
+        .rename_axis("timestamp")
+        .reset_index()
+    )
     layers: list[alt.Chart] = []
     if {"lower_pi", "upper_pi"}.issubset(forecast.columns):
         layers.append(
