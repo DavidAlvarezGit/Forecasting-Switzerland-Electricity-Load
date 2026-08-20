@@ -9,25 +9,22 @@ On the final held-out test period, the LSTM achieves **436.8 MW MAE**, improving
 ## Architecture
 
 ```text
-ENTSO-E load + archived weather forecasts
+ENTSO-E load +  weather forecasts
                     |
                     v
           incremental ingestion
                     |
                     v
-       point-in-time validation
+       validation and data pipeline
                     |
                     v
-        causal feature pipeline
+            baselines + LSTM
                     |
                     v
-     seasonal baselines + LSTM
+            Cross-validation
                     |
                     v
-      rolling-origin backtest
-                    |
-                    v
- adaptive conformal prediction
+          prediction intervals
                     |
                     v
           Streamlit dashboard
