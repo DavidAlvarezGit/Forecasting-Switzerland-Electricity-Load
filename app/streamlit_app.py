@@ -228,9 +228,12 @@ def _performance_chart(results: DashboardResults) -> alt.Chart | None:
 
 
 def _forecast_tab(results: DashboardResults, context_hours: int) -> None:
-    st.markdown('<p class="kicker">Latest archived issue</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kicker">24-hour outlook</p>', unsafe_allow_html=True)
     st.subheader("24-hour forecast")
-    st.caption("Blue is observed demand, red is the LSTM forecast, and shading is its uncertainty range.")
+    st.caption(
+        "Blue shows demand known when the forecast was issued. Red starts one hour later, "
+        "and shading shows the uncertainty range."
+    )
     st.altair_chart(_forecast_chart(results, context_hours), use_container_width=True)
     table = results.forecast.rename(
         columns={

@@ -24,6 +24,19 @@ def _datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
     return result.sort_index()
 
 
+def _latest_observed_history(samples: pd.DataFrame, artifact: Any) -> pd.Series:
+    """Reconstruct observations known at the latest forecast origin."""
+    origin = samples.index[-1]
+    latest = samples.iloc[-1]
+    values: dict[pd.Timestamp, float] = {}
+    for column in artifact.history_columns:
+        if column not in latest or pd.isna(latest[column]):
+            continue
+        lag = int(column.rsplit("_", maxsplit=1)[-1])
+        values[origin - pd.Timedelta(hours=lag)] = float(latest[column])
+    return pd.Series(values, name="true_load_mw", dtype=float).sort_index()
+
+
 def _run_backtest(
     function: Callable[..., dict[str, Any]] | None,
     samples: pd.DataFrame,
@@ -104,13 +117,12 @@ def build_dashboard_results(
         notices.append(forecast_notice)
 
     history = pd.DataFrame()
-    recent_actual = pd.Series(dtype=float, name="true_load_mw")
+    recent_actual = _latest_observed_history(samples, artifact)
     metrics: dict[str, Any] = {}
     if backtest:
         history = backtest.get("forecast_history_df", pd.DataFrame())
         if isinstance(history, pd.DataFrame) and not history.empty:
             history = _datetime_index(history)
-            recent_actual = history.groupby(level=0)["true_load_mw"].last()
         metrics = {
             "mae_model": backtest["mae_model"],
             "rmse_model": backtest["rmse_model"],
