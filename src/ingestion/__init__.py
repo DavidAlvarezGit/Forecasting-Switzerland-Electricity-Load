@@ -1,15 +1,5 @@
-from .entsoe import ingest_entsoe
-from .openmeteo import (
-    ingest_weather_historical,
-    ingest_weather_historical_forecast,
-    ingest_weather_live_forecast,
-    ingest_weather_previous_runs,
-)
+"""Data-source adapters.
 
-__all__ = [
-    "ingest_entsoe",
-    "ingest_weather_historical",
-    "ingest_weather_historical_forecast",
-    "ingest_weather_live_forecast",
-    "ingest_weather_previous_runs",
-]
+Import concrete modules directly so command-line execution with ``python -m`` does not
+preload the target module through package initialization.
+"""

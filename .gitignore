@@ -43,6 +43,9 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.cache.sqlite
+.cache.sqlite-*
+.cache/
 nosetests.xml
 coverage.xml
 *.cover
@@ -77,6 +80,12 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+notebook/tb_logs/
+
+# Rebuildable raw/interim data; keep compact processed demo artifacts only.
+data/raw/
+data/interim/
+data/state/
 
 # IPython
 profile_default/

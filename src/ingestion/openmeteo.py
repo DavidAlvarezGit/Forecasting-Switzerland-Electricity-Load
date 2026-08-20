@@ -1,439 +1,323 @@
+from __future__ import annotations
+
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import openmeteo_requests
+import numpy as np
 import pandas as pd
-import requests_cache
-from retry_requests import retry
+import requests
 
-if __package__ in (None, ""):
-    from state_utils import (
-        get_state_timestamp,
-        load_json_state,
-        save_json_state,
-        set_state_timestamp,
-    )
-else:
-    from .state_utils import (
-        get_state_timestamp,
-        load_json_state,
-        save_json_state,
-        set_state_timestamp,
-    )
+from src.forecast_config import DEFAULT_CONFIG, ForecastConfig, daily_origins
 
+SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
+SOURCE_NAME = "open-meteo-single-runs"
 
-OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-OPENMETEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-OPENMETEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
-OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-
-CITIES = [
-    "Zurich", "Geneva", "Bern", "Basel", "Lausanne",
-    "Lucerne", "St_Gallen", "Lugano", "Interlaken", "Central_CH",
-]
-
-LAT = [47.3769, 46.2044, 46.9480, 47.5596, 46.5197,
-       47.0502, 47.4245, 46.0101, 46.6863, 46.8182]
-
-LON = [8.5417, 6.1432, 7.4474, 7.5886, 6.6323,
-       8.3093, 9.3767, 8.9600, 7.8632, 8.2275]
-
-HOURLY_VARS = [
-    "temperature_2m",
-    "apparent_temperature",
-    "relative_humidity_2m",
-    "precipitation_probability",
-    "precipitation",
-    "rain",
-    "snowfall",
-    "snow_depth",
-    "cloud_cover",
-    "wind_speed_10m",
-    "surface_pressure",
-    "is_day",
-    "sunshine_duration",
-]
-
-DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
-PROCESSED_DIR = DATA_ROOT / "raw"
-STATE_FILE = DATA_ROOT / "state" / "openmeteo_state.json"
-
-DATASET_HISTORICAL = "weather_historical"
-DATASET_HISTORICAL_FORECAST_HOURLY = "weather_historical_forecast_hourly"
-DATASET_PREVIOUS_RUNS = "weather_previous_runs"
-DATASET_LIVE_FORECAST = "weather_live_forecast"
-
-PREVIOUS_RUN_BASE_VARS = [
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "snowfall",
-    "cloud_cover",
-    "wind_speed_10m",
-    "surface_pressure",
-]
+CITIES = (
+    ("zurich", 47.3769, 8.5417),
+    ("geneva", 46.2044, 6.1432),
+    ("bern", 46.9480, 7.4474),
+    ("basel", 47.5596, 7.5886),
+    ("lausanne", 46.5197, 6.6323),
+    ("lucerne", 47.0502, 8.3093),
+    ("st_gallen", 47.4245, 9.3767),
+    ("lugano", 46.0101, 8.9600),
+    ("interlaken", 46.6863, 7.8632),
+    ("central_ch", 46.8182, 8.2275),
+)
 
 
-def load_state() -> dict[str, str]:
-    return load_json_state(STATE_FILE)
+class ModelRunUnavailable(RuntimeError):
+    """Raised when the archive explicitly reports a missing model run."""
 
 
-def save_state(state: dict[str, str]):
-    save_json_state(STATE_FILE, state)
-
-
-def get_last_timestamp(state: dict[str, str], key: str) -> pd.Timestamp | None:
-    return get_state_timestamp(state, key)
-
-
-def update_state(state: dict[str, str], key: str, timestamp: pd.Timestamp):
-    set_state_timestamp(state, key, timestamp)
-    save_state(state)
-
-
-def build_client(expire_after: int = 3600):
-    cache_session = requests_cache.CachedSession(".cache", expire_after=expire_after)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-    return openmeteo_requests.Client(session=retry_session)
-
-
-def fetch_with_retries(
-    client,
-    url: str,
+def _request_json(
     params: dict[str, Any],
     retries: int = 5,
-    timeout_backoff_base: int = 2,
-):
+    timeout_seconds: int = 60,
+) -> list[dict[str, Any]]:
     for attempt in range(retries):
         try:
-            return client.weather_api(url, params=params)
-        except Exception as exc:
+            response = requests.get(SINGLE_RUNS_URL, params=params, timeout=timeout_seconds)
+            response.raise_for_status()
+            if "modelRunUnavailable" in response.text:
+                raise ModelRunUnavailable(response.text)
+            payload = response.json()
+            return payload if isinstance(payload, list) else [payload]
+        except (requests.RequestException, ValueError):
             if attempt == retries - 1:
                 raise
-            sleep_time = timeout_backoff_base ** attempt
-            print(f"[Retry {attempt + 1}] error: {exc} -> sleeping {sleep_time}s")
-            time.sleep(sleep_time)
+            time.sleep(2**attempt)
+    raise RuntimeError("Open-Meteo request failed without an exception")
 
 
-def _build_common_params(hourly_vars: list[str], timezone: str = "Europe/Zurich") -> dict[str, Any]:
+def _request_params(
+    run_utc: pd.Timestamp,
+    config: ForecastConfig,
+    locations: tuple[tuple[str, float, float], ...] = CITIES,
+) -> dict[str, Any]:
     return {
-        "latitude": LAT,
-        "longitude": LON,
-        "hourly": hourly_vars,
-        "timezone": timezone,
+        "latitude": [latitude for _, latitude, _ in locations],
+        "longitude": [longitude for _, _, longitude in locations],
+        "hourly": list(config.weather_variables),
+        "models": config.weather_model,
+        "run": run_utc.strftime("%Y-%m-%dT%H:%M"),
+        "forecast_hours": 192,
+        "timezone": "UTC",
     }
 
 
-def _build_date_range(
-    start_date: str,
-    end_date: str,
-    last_ts: pd.Timestamp | None,
-) -> tuple[str, str] | None:
-    effective_start = start_date
-    if last_ts is not None:
-        inferred_start = (last_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        effective_start = max(start_date, inferred_start)
-
-    if pd.Timestamp(effective_start) > pd.Timestamp(end_date):
-        return None
-
-    return effective_start, end_date
-
-
-def parse_hourly_responses(responses, hourly_vars: list[str]) -> pd.DataFrame:
-    rows: list[pd.DataFrame] = []
-
-    for i, response in enumerate(responses):
-        hourly = response.Hourly()
-        df = pd.DataFrame(
-            {
-                "timestamp_utc": pd.date_range(
-                    start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-                    end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-                    freq=pd.Timedelta(seconds=hourly.Interval()),
-                    inclusive="left",
-                ),
-                "city": CITIES[i],
-                "location_id": i,
-                "latitude": response.Latitude(),
-                "longitude": response.Longitude(),
-                "elevation": response.Elevation(),
-                "retrieved_at_utc": pd.Timestamp.utcnow(),
-            }
-        )
-
-        for j, var in enumerate(hourly_vars):
-            df[var] = hourly.Variables(j).ValuesAsNumpy()
-
-        rows.append(df)
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.concat(rows, ignore_index=True)
+def _request_run(run_utc: pd.Timestamp, config: ForecastConfig) -> list[dict[str, Any]]:
+    """Request all locations together, then split only if archive streaming fails."""
+    try:
+        return _request_json(_request_params(run_utc, config))
+    except (requests.RequestException, ValueError, ModelRunUnavailable) as combined_error:
+        payload: list[dict[str, Any]] = []
+        try:
+            for location in CITIES:
+                payload.extend(_request_json(_request_params(run_utc, config, (location,))))
+            return payload
+        except (requests.RequestException, ValueError, ModelRunUnavailable) as split_error:
+            raise RuntimeError(f"Weather run {run_utc} could not be retrieved") from (
+                split_error or combined_error
+            )
 
 
-def parse_historical_forecast_responses(
-    responses,
-    hourly_vars: list[str],
+def _payload_is_complete(
+    payload: list[dict[str, Any]],
+    target_index: pd.DatetimeIndex,
+    config: ForecastConfig,
+) -> bool:
+    if len(payload) != len(CITIES):
+        return False
+    for location in payload:
+        hourly = location.get("hourly", {})
+        timestamps = pd.to_datetime(hourly.get("time", []), utc=True)
+        positions = np.flatnonzero(timestamps.isin(target_index))
+        if len(positions) != config.horizon_hours:
+            return False
+        for variable in config.weather_variables:
+            values = pd.to_numeric(pd.Series(hourly.get(variable, [])), errors="coerce")
+            if len(values) <= int(positions.max()) or values.iloc[positions].isna().any():
+                return False
+    return True
+
+
+def fetch_weather_run(
+    forecast_origin_utc: pd.Timestamp,
+    config: ForecastConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
-    hourly_rows: list[pd.DataFrame] = []
+    """Fetch one complete weather vintage available at a daily forecast origin."""
+    origin = pd.Timestamp(forecast_origin_utc).tz_convert("UTC")
+    target_index = pd.date_range(
+        origin + pd.Timedelta(hours=1),
+        periods=config.horizon_hours,
+        freq="h",
+        tz="UTC",
+    )
+    scheduled_run = config.weather_run_for_origin(origin)
+    candidate_runs = tuple(
+        scheduled_run - pd.Timedelta(hours=offset)
+        for offset in range(0, 121, 12)
+    )
+    payload: list[dict[str, Any]] | None = None
+    last_error: Exception | None = None
+    run_utc: pd.Timestamp | None = None
+    for candidate in candidate_runs:
+        try:
+            payload = _request_run(candidate, config)
+            if not _payload_is_complete(payload, target_index, config):
+                split_payload: list[dict[str, Any]] = []
+                for location in CITIES:
+                    split_payload.extend(
+                        _request_json(_request_params(candidate, config, (location,)))
+                    )
+                payload = split_payload
+            if not _payload_is_complete(payload, target_index, config):
+                raise ValueError(f"Weather run {candidate} has incomplete target values")
+            run_utc = candidate
+            break
+        except (requests.RequestException, ValueError, RuntimeError) as error:
+            last_error = error
+    if payload is None or run_utc is None:
+        raise RuntimeError(
+            f"No complete weather run from the scheduled or ten preceding cycles is available for {origin}"
+        ) from last_error
 
-    for i, response in enumerate(responses):
-        hourly = response.Hourly()
-
-        hourly_df = pd.DataFrame(
-            {
-                "timestamp_utc": pd.date_range(
-                    start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-                    end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-                    freq=pd.Timedelta(seconds=hourly.Interval()),
-                    inclusive="left",
-                ),
-                "city": CITIES[i],
-                "location_id": i,
-                "latitude": response.Latitude(),
-                "longitude": response.Longitude(),
-                "elevation": response.Elevation(),
-                "retrieved_at_utc": pd.Timestamp.utcnow(),
-            }
+    available_utc = config.weather_available_at(run_utc)
+    if available_utc > origin:
+        raise ValueError(
+            f"Weather run {run_utc} is not available by forecast origin {origin}."
         )
 
-        for j, col in enumerate(hourly_vars):
-            hourly_df[col] = hourly.Variables(j).ValuesAsNumpy()
+    if len(payload) != len(CITIES):
+        raise ValueError(f"Expected {len(CITIES)} locations, received {len(payload)}")
 
-        hourly_rows.append(hourly_df)
+    retrieved_at = pd.Timestamp.now(tz="UTC")
+    frames: list[pd.DataFrame] = []
+    for (city, requested_lat, requested_lon), location in zip(CITIES, payload, strict=True):
+        hourly = location.get("hourly", {})
+        timestamps = pd.to_datetime(hourly.get("time", []), utc=True)
+        frame = pd.DataFrame({"target_timestamp_utc": timestamps})
+        for variable in config.weather_variables:
+            values = hourly.get(variable)
+            if values is None:
+                raise ValueError(f"Open-Meteo response is missing {variable} for {city}")
+            frame[variable] = values
+        frame = frame[frame["target_timestamp_utc"].isin(target_index)].copy()
+        frame["city"] = city
+        frame["requested_latitude"] = requested_lat
+        frame["requested_longitude"] = requested_lon
+        frame["grid_latitude"] = location.get("latitude")
+        frame["grid_longitude"] = location.get("longitude")
+        frames.append(frame)
 
-    if not hourly_rows:
-        return pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True)
+    result["forecast_origin_utc"] = origin
+    result["forecast_origin_local"] = origin.tz_convert(config.timezone)
+    result["weather_run_utc"] = run_utc
+    result["weather_run_is_fallback"] = run_utc != scheduled_run
+    result["weather_available_utc"] = available_utc
+    result["forecast_lead_hour"] = (
+        (result["target_timestamp_utc"] - origin) / pd.Timedelta(hours=1)
+    ).astype("int16")
+    result["weather_model"] = config.weather_model
+    result["source"] = SOURCE_NAME
+    result["source_url"] = SINGLE_RUNS_URL
+    result["retrieved_at_utc"] = retrieved_at
 
-    return pd.concat(hourly_rows, ignore_index=True)
+    expected_rows = len(CITIES) * config.horizon_hours
+    if len(result) != expected_rows:
+        raise ValueError(f"Expected {expected_rows} run rows, received {len(result)}")
+    if not result["forecast_lead_hour"].between(1, config.horizon_hours).all():
+        raise ValueError("Weather run contains targets outside the configured horizon")
+    if not (result["weather_available_utc"] <= result["forecast_origin_utc"]).all():
+        raise ValueError("A weather value was issued after its forecast origin")
+    if result.groupby("forecast_origin_utc")["weather_run_utc"].nunique().max() != 1:
+        raise ValueError("A forecast origin contains more than one weather run")
+    return result.sort_values(["forecast_origin_utc", "target_timestamp_utc", "city"])
 
 
-def _dataset_dir(dataset: str) -> Path:
-    return PROCESSED_DIR / dataset
+def _partition_path(year: int, config: ForecastConfig) -> Path:
+    return config.weather_runs_path / f"year={year}.parquet"
 
 
-def _year_path(dataset: str, year: int) -> Path:
-    return _dataset_dir(dataset) / f"year={year}.parquet"
-
-
-def save_partitioned(
-    df: pd.DataFrame,
-    dataset: str,
-    time_col: str,
-    dedupe_cols: list[str],
-):
-    if df.empty:
-        return
-
-    data = df.copy()
-    data["year"] = data[time_col].dt.year
-
-    for year, df_year in data.groupby("year"):
-        path = _year_path(dataset, int(year))
-
+def _save_partitions(data: pd.DataFrame, config: ForecastConfig) -> None:
+    local_year = data["forecast_origin_utc"].dt.tz_convert(config.timezone).dt.year
+    for year, frame in data.groupby(local_year):
+        path = _partition_path(int(year), config)
         if path.exists():
             existing = pd.read_parquet(path)
-            combined = (
-                pd.concat([existing, df_year], ignore_index=True)
-                .drop_duplicates(subset=dedupe_cols, keep="last")
-                .sort_values(time_col)
-                .reset_index(drop=True)
+            frame = pd.concat([existing, frame], ignore_index=True)
+        frame = (
+            frame.sort_values("retrieved_at_utc")
+            .drop_duplicates(
+                ["forecast_origin_utc", "target_timestamp_utc", "city"],
+                keep="last",
             )
-        else:
-            combined = df_year.sort_values(time_col).reset_index(drop=True)
-
+            .sort_values(["forecast_origin_utc", "target_timestamp_utc", "city"])
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_parquet(path, index=False)
-        print(f"Saved dataset={dataset} year={year} -> {path} | shape={combined.shape}")
+        frame.to_parquet(path, index=False)
 
 
-def load_dataset(dataset: str, time_col: str) -> pd.DataFrame:
-    files = sorted(_dataset_dir(dataset).glob("year=*.parquet"))
-    if not files:
+def load_weather_runs(config: ForecastConfig = DEFAULT_CONFIG) -> pd.DataFrame:
+    paths = sorted(config.weather_runs_path.glob("year=*.parquet"))
+    if not paths:
         return pd.DataFrame()
-
-    return (
-        pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-        .sort_values(time_col)
-        .reset_index(drop=True)
+    data = pd.concat((pd.read_parquet(path) for path in paths), ignore_index=True)
+    for column in (
+        "forecast_origin_utc",
+        "weather_run_utc",
+        "weather_available_utc",
+        "target_timestamp_utc",
+        "retrieved_at_utc",
+    ):
+        data[column] = pd.to_datetime(data[column], utc=True)
+    scheduled_run = data["forecast_origin_utc"].dt.normalize() + pd.Timedelta(
+        hours=config.weather_run_hour_utc
     )
+    data["weather_run_is_fallback"] = data["weather_run_utc"] != scheduled_run
+    return data.sort_values(["forecast_origin_utc", "target_timestamp_utc", "city"])
 
 
-def ingest_weather_historical(
+def ingest_weather_forecast_runs(
     start_date: str,
     end_date: str,
-    hourly_vars: list[str] | None = None,
+    config: ForecastConfig = DEFAULT_CONFIG,
+    max_workers: int = 4,
 ) -> pd.DataFrame:
-    vars_to_use = hourly_vars or HOURLY_VARS
-    state = load_state()
-    last_ts = get_last_timestamp(state, DATASET_HISTORICAL)
-    date_range = _build_date_range(start_date, end_date, last_ts)
-    if date_range is None:
-        print("No new historical weather window to fetch")
-        return load_dataset(DATASET_HISTORICAL, "timestamp_utc")
+    """Incrementally archive one auditable ECMWF run per local forecast day."""
+    origins = daily_origins(start_date, end_date, config)
+    existing = load_weather_runs(config)
+    existing_origins: set[pd.Timestamp] = set()
+    if not existing.empty:
+        expected_rows = len(CITIES) * config.horizon_hours
+        grouped = existing.groupby("forecast_origin_utc")
+        complete = grouped.size().eq(expected_rows) & grouped[
+            list(config.weather_variables)
+        ].count().eq(expected_rows).all(axis=1)
+        existing_origins = set(pd.DatetimeIndex(complete[complete].index))
+    missing = [origin for origin in origins if origin not in existing_origins]
+    if not missing:
+        return existing
 
-    effective_start, effective_end = date_range
+    pending = missing
+    completed_total = 0
+    for attempt in range(1, 4):
+        failed: list[pd.Timestamp] = []
+        checkpoint: list[pd.DataFrame] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(fetch_weather_run, origin, config): origin for origin in pending
+            }
+            for future in as_completed(futures):
+                origin = futures[future]
+                try:
+                    checkpoint.append(future.result())
+                    completed_total += 1
+                except (requests.RequestException, ValueError, RuntimeError) as error:
+                    failed.append(origin)
+                    print(f"Will retry weather run for {origin}: {type(error).__name__}", flush=True)
+                if len(checkpoint) >= 25:
+                    _save_partitions(pd.concat(checkpoint, ignore_index=True), config)
+                    checkpoint.clear()
+                    print(
+                        f"Archived {completed_total}/{len(missing)} missing weather runs",
+                        flush=True,
+                    )
+        if checkpoint:
+            _save_partitions(pd.concat(checkpoint, ignore_index=True), config)
+            print(
+                f"Archived {completed_total}/{len(missing)} missing weather runs",
+                flush=True,
+            )
+        if not failed:
+            break
+        pending = failed
+        print(f"Retry pass {attempt}: {len(pending)} runs remain", flush=True)
+    else:
+        raise RuntimeError(f"Could not archive {len(pending)} weather runs after three passes")
 
-    params = _build_common_params(vars_to_use)
-    params["start_date"] = effective_start
-    params["end_date"] = effective_end
-
-    client = build_client()
-    responses = fetch_with_retries(client, OPENMETEO_ARCHIVE_URL, params)
-    df = parse_hourly_responses(responses, vars_to_use)
-
-    if df.empty:
-        print("No new historical weather data")
-        return load_dataset(DATASET_HISTORICAL, "timestamp_utc")
-
-    save_partitioned(
-        df=df,
-        dataset=DATASET_HISTORICAL,
-        time_col="timestamp_utc",
-        dedupe_cols=["timestamp_utc", "location_id"],
-    )
-    update_state(state, DATASET_HISTORICAL, df["timestamp_utc"].max())
-    return load_dataset(DATASET_HISTORICAL, "timestamp_utc")
-
-
-def ingest_weather_historical_forecast(
-    start_date: str,
-    end_date: str,
-    model: str = "best_match",
-    hourly_vars: list[str] | None = None,
-) -> pd.DataFrame:
-    hourly_to_use = hourly_vars or HOURLY_VARS
-
-    state = load_state()
-    last_ts = get_last_timestamp(state, DATASET_HISTORICAL_FORECAST_HOURLY)
-    date_range = _build_date_range(start_date, end_date, last_ts)
-    if date_range is None:
-        print("No new historical forecast weather window to fetch")
-        return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
-
-    effective_start, effective_end = date_range
-
-    params = _build_common_params(hourly_to_use)
-    params["start_date"] = effective_start
-    params["end_date"] = effective_end
-    params["models"] = model
-
-    client = build_client()
-    responses = fetch_with_retries(client, OPENMETEO_HISTORICAL_FORECAST_URL, params)
-    hourly_df = parse_historical_forecast_responses(
-        responses,
-        hourly_vars=hourly_to_use,
-    )
-
-    if hourly_df.empty:
-        print("No new historical forecast weather data")
-        return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
-
-    save_partitioned(
-        df=hourly_df,
-        dataset=DATASET_HISTORICAL_FORECAST_HOURLY,
-        time_col="timestamp_utc",
-        dedupe_cols=["timestamp_utc", "location_id"],
-    )
-    update_state(state, DATASET_HISTORICAL_FORECAST_HOURLY, hourly_df["timestamp_utc"].max())
-
-    return load_dataset(DATASET_HISTORICAL_FORECAST_HOURLY, "timestamp_utc")
+    return load_weather_runs(config)
 
 
-def ingest_weather_previous_runs(
-    start_date: str,
-    end_date: str,
-    previous_day: int = 1,
-    base_vars: list[str] | None = None,
-) -> pd.DataFrame:
-    """Fetch fixed-vintage forecasts for leakage-safe model training.
-
-    ``previous_day=1`` returns each target-time value as predicted 24 hours
-    earlier, unlike the stitched Historical Forecast API series.
-    """
-    if previous_day < 1 or previous_day > 7:
-        raise ValueError("previous_day must be between 1 and 7")
-
-    variables = base_vars or PREVIOUS_RUN_BASE_VARS
-    hourly_vars = [f"{variable}_previous_day{previous_day}" for variable in variables]
-    state_key = f"{DATASET_PREVIOUS_RUNS}_day{previous_day}"
-    state = load_state()
-    last_ts = get_last_timestamp(state, state_key)
-    date_range = _build_date_range(start_date, end_date, last_ts)
-    if date_range is None:
-        return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
-
-    effective_start, effective_end = date_range
-    params = _build_common_params(hourly_vars)
-    params["start_date"] = effective_start
-    params["end_date"] = effective_end
-
-    client = build_client()
-    responses = fetch_with_retries(client, OPENMETEO_PREVIOUS_RUNS_URL, params)
-    df = parse_hourly_responses(responses, hourly_vars)
-    if df.empty:
-        return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
-
-    save_partitioned(
-        df=df,
-        dataset=DATASET_PREVIOUS_RUNS,
-        time_col="timestamp_utc",
-        dedupe_cols=["timestamp_utc", "location_id"],
-    )
-    update_state(state, state_key, df["timestamp_utc"].max())
-    return load_dataset(DATASET_PREVIOUS_RUNS, "timestamp_utc")
-
-
-def ingest_weather_live_forecast(
-    forecast_hours: int = 24,
-    hourly_vars: list[str] | None = None,
-) -> pd.DataFrame:
-    vars_to_use = hourly_vars or HOURLY_VARS
-    params = _build_common_params(vars_to_use)
-    params["forecast_hours"] = forecast_hours
-
-    client = build_client()
-    responses = fetch_with_retries(client, OPENMETEO_FORECAST_URL, params)
-    df = parse_hourly_responses(responses, vars_to_use)
-
-    if df.empty:
-        print("No new live forecast weather data")
-        return load_dataset(DATASET_LIVE_FORECAST, "timestamp_utc")
-
-    save_partitioned(
-        df=df,
-        dataset=DATASET_LIVE_FORECAST,
-        time_col="timestamp_utc",
-        dedupe_cols=["timestamp_utc", "location_id"],
-    )
-
-    state = load_state()
-    update_state(state, DATASET_LIVE_FORECAST, df["timestamp_utc"].max())
-    return load_dataset(DATASET_LIVE_FORECAST, "timestamp_utc")
+def latest_scheduled_origin(
+    now: pd.Timestamp | None = None,
+    config: ForecastConfig = DEFAULT_CONFIG,
+) -> pd.Timestamp:
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now).tz_convert("UTC")
+    local_now = current.tz_convert(config.timezone)
+    origin = config.origin_for_local_date(local_now)
+    if origin > current:
+        origin = config.origin_for_local_date(local_now - pd.Timedelta(days=1))
+    return origin
 
 
 if __name__ == "__main__":
-    historical_df = ingest_weather_historical(
-        start_date="2020-01-01",
-        end_date="2026-04-19",
+    result = ingest_weather_forecast_runs("2024-03-15", "2026-04-18")
+    print(
+        f"Archived {result['forecast_origin_utc'].nunique():,} daily runs and "
+        f"{len(result):,} location/lead rows."
     )
-    print("historical shape:", historical_df.shape)
-
-    historical_forecast_hourly_df = ingest_weather_historical_forecast(
-        start_date="2020-01-01",
-        end_date="2026-04-19",
-    )
-    print("historical_forecast_hourly shape:", historical_forecast_hourly_df.shape)
-
-    previous_runs_df = ingest_weather_previous_runs(
-        start_date="2024-01-01",
-        end_date="2026-04-19",
-        previous_day=1,
-    )
-    print("previous_runs shape:", previous_runs_df.shape)
-
-    live_forecast_df = ingest_weather_live_forecast(forecast_hours=24)
-    print("live_forecast shape:", live_forecast_df.shape)

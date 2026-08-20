@@ -12,7 +12,7 @@ def main() -> None:
     model_out_path: Path = results["model_out_path"]
     metrics_path: Path = results["metrics_path"]
 
-    print("Model comparison:")
+    print("Untouched final-test comparison:")
     print(compare_df)
     print(f"Saved model to: {model_out_path}")
     print(f"Saved metrics to: {metrics_path}")

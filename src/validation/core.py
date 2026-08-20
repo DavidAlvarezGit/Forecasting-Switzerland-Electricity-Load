@@ -1,5 +1,5 @@
 
-from typing import Callable
+from collections.abc import Callable
 
 
 class ValidationError(Exception):

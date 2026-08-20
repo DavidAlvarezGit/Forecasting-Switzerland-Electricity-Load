@@ -1,684 +1,376 @@
 from __future__ import annotations
 
+import copy
 import json
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.base import BaseEstimator, RegressorMixin, clone
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-TARGET_COL = "load_load_mw"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "processed"
-FEATURES_PATH = DATA_DIR / "lstm_features.parquet"
-MODEL_DIR = DATA_DIR / "models"
-
-
-def _split_conformal_quantile(scores: list[float] | np.ndarray, alpha: float) -> tuple[float, float]:
-    score_arr = np.asarray(scores, dtype=float)
-    if score_arr.ndim != 1:
-        raise ValueError("scores must be a 1D array-like.")
-    if score_arr.size < 1:
-        raise ValueError("Need at least one score.")
-
-    n = score_arr.size
-    q_level = np.ceil((n + 1) * (1.0 - float(alpha))) / n
-    q_level = float(np.clip(q_level, 0.0, 1.0))
-
-    q_hat = np.quantile(score_arr, q_level, method="higher")
-
-    return float(q_hat), q_level
+from src.forecast_config import DEFAULT_CONFIG, ForecastConfig
+from src.modeling.evaluation import (
+    prediction_metrics,
+    rolling_aci_intervals,
+    seasonal_baselines,
+    tune_aci_on_validation,
+)
 
 
 @dataclass(slots=True)
 class LSTMTrainConfig:
-    target_col: str = TARGET_COL
-    features_path: Path = FEATURES_PATH
-    lookback: int = 168 * 2
-    horizon: int = 24
-    batch_size: int = 512
-    infer_batch_size: int = 128
-    epochs: int = 10
+    batch_size: int = 64
+    epochs: int = 80
     learning_rate: float = 1e-3
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    top_k_features: int = 32
-    min_forecast_weather_features: int = 8
-    corr_threshold: float = 0.995
-    selection_horizons: tuple[int, ...] = (1, 6, 12, 24)
     hidden_size: int = 64
-    num_layers: int = 2
+    num_layers: int = 1
     dropout: float = 0.15
-    patience: int = 3
+    patience: int = 10
     weight_decay: float = 1e-4
-    model_out_path: Path = MODEL_DIR / "best_lstm_24h.pt"
+    model_out_path: Path = DEFAULT_CONFIG.model_path
 
 
-class LSTMRegressor(nn.Module):
+class DailyLoadLSTM(nn.Module):
+    """Encode load history with an LSTM, then combine it with known-at-origin context."""
+
     def __init__(
         self,
-        input_size: int,
-        output_horizon: int,
-        hidden_size: int = 128,
-        num_layers: int = 5,
+        context_size: int,
+        horizon: int = 24,
+        hidden_size: int = 64,
+        num_layers: int = 1,
         dropout: float = 0.15,
     ) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size=input_size,
+            input_size=1,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = nn.Linear(hidden_size, output_horizon)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden_size + context_size, horizon)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        return self.head(out)
-
-
-class ACI(BaseEstimator, RegressorMixin):
-    def __init__(self, base_model: Any, alpha: float = 0.1, eta: float = 0.01, window_size: int | None = None):
-        self.base_model = base_model
-        self.alpha = alpha
-        self.eta = eta
-        self.window_size = window_size
-
-    def _validate_params(self) -> None:
-        if not (0 < float(self.alpha) < 1):
-            raise ValueError("alpha must be in (0, 1)")
-        if not (0 < float(self.eta) <= 1):
-            raise ValueError("eta must be in (0, 1]")
-        if self.window_size is not None:
-            if self.window_size < 1:
-                raise ValueError("window_size must be None or an integer >= 1")
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "ACI":
-        self._validate_params()
-        x_checked, y_checked = check_X_y(X, y)
-
-        self.model_ = clone(self.base_model)
-        self.model_.fit(x_checked, y_checked)
-
-        scores = np.abs(y_checked - self.model_.predict(x_checked))
-        scores = np.asarray(scores, dtype=float)
-
-        self.window_size_ = len(scores) if self.window_size is None else min(self.window_size, len(scores))
-        if self.window_size_ < 1:
-            raise ValueError("Need at least one calibration score.")
-
-        self.score_buffer_ = list(scores[-self.window_size_ :])
-        self.alpha_t_ = float(self.alpha)
-        self.q_hat_ = _split_conformal_quantile(self.score_buffer_, self.alpha_t_)[0]
-        return self
-
-    def calibrate(self, X: np.ndarray | None = None, y: np.ndarray | None = None, reset_alpha: bool = True) -> "ACI":
-        check_is_fitted(self, ["model_"])
-        if X is None and y is None:
-            return self
-
-        if X is None or y is None:
-            raise ValueError("X and y must both be provided when calibrating.")
-
-        x_checked, y_checked = check_X_y(X, y)
-        scores = np.abs(y_checked - self.model_.predict(x_checked))
-        scores = np.asarray(scores, dtype=float)
-
-        self.window_size_ = len(scores) if self.window_size is None else min(self.window_size, len(scores))
-        if self.window_size_ < 1:
-            raise ValueError("Need at least one calibration score.")
-
-        self.score_buffer_ = list(scores[-self.window_size_ :])
-
-        if reset_alpha or not hasattr(self, "alpha_t_"):
-            self.alpha_t_ = float(self.alpha)
-
-        self.q_hat_ = _split_conformal_quantile(self.score_buffer_, self.alpha_t_)[0]
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        check_is_fitted(self, ["model_"])
-        x_checked = check_array(X)
-        return self.model_.predict(x_checked)
-
-    def predict_interval(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        check_is_fitted(self, ["model_", "q_hat_"])
-        yhat = self.predict(X)
-        return yhat - self.q_hat_, yhat + self.q_hat_
-
-    def predict_interval_sequential(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        check_is_fitted(self, ["model_", "q_hat_", "score_buffer_", "alpha_t_"])
-        x_checked = check_array(X)
-        y_checked = np.asarray(y, dtype=float)
-
-        if x_checked.shape[0] != y_checked.shape[0]:
-            raise ValueError("X and y must have the same number of rows.")
-
-        n = x_checked.shape[0]
-        lower = np.zeros(n, dtype=float)
-        upper = np.zeros(n, dtype=float)
-
-        alpha_t = float(self.alpha_t_)
-        score_buffer = list(self.score_buffer_)
-
-        for t in range(n):
-            q_hat_t = _split_conformal_quantile(score_buffer, alpha_t)[0]
-
-            yhat_t = float(self.model_.predict(x_checked[t].reshape(1, -1))[0])
-            lower[t] = yhat_t - q_hat_t
-            upper[t] = yhat_t + q_hat_t
-
-            score_t = abs(y_checked[t] - yhat_t)
-            err_t = int(score_t > q_hat_t)
-
-            alpha_t = float(np.clip(alpha_t + self.eta * (self.alpha - err_t), 1e-6, 1 - 1e-6))
-
-            score_buffer.append(float(score_t))
-            if len(score_buffer) > self.window_size_:
-                score_buffer.pop(0)
-
-        self.alpha_t_ = alpha_t
-        self.score_buffer_ = score_buffer
-        self.q_hat_ = _split_conformal_quantile(self.score_buffer_, self.alpha_t_)[0]
-        return lower, upper
+    def forward(self, history: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        encoded, _ = self.lstm(history)
+        combined = torch.cat([encoded[:, -1, :], context], dim=1)
+        return self.head(self.dropout(combined))
 
 
-def load_lstm_dataset(input_path: Path, target_col: str) -> pd.DataFrame:
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file '{input_path}' not found.")
-
-    df = pd.read_parquet(input_path)
-    if df.empty:
-        raise ValueError("Input dataframe is empty.")
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found.")
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True)
-
-    if df.index.has_duplicates:
-        raise ValueError("Datetime index contains duplicates.")
-
-    return df.sort_index()
+def set_deterministic_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-def split_dataset(
-    df: pd.DataFrame,
-    train_ratio: float,
-    val_ratio: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
-    return train_df, val_df, test_df
-
-
-def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    y_true_flat = y_true.reshape(-1)
-    y_pred_flat = y_pred.reshape(-1)
-    mae = float(mean_absolute_error(y_true_flat, y_pred_flat))
-    rmse = float(np.sqrt(mean_squared_error(y_true_flat, y_pred_flat)))
-    return {"mae": mae, "rmse": rmse}
-
-
-def previous_day_baseline(
-    target: pd.Series,
-    lookback: int,
-    horizon: int,
-) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
-    """Build the same-hour-previous-day baseline from known observations."""
-    y_true: list[np.ndarray] = []
-    predictions: list[np.ndarray] = []
-    idx: list[pd.Timestamp] = []
-    arr = target.to_numpy(dtype=np.float32)
-
-    minimum_anchor = max(lookback, 24)
-    horizon_offsets = np.arange(horizon)
-    for anchor in range(minimum_anchor, len(arr) - horizon + 1):
-        actual = arr[anchor : anchor + horizon]
-        daily = arr[anchor + horizon_offsets - 24]
-
-        y_true.append(actual)
-        predictions.append(daily)
-        idx.append(target.index[anchor])
-
-    return (
-        np.asarray(y_true, dtype=np.float32),
-        np.asarray(predictions, dtype=np.float32),
-        pd.DatetimeIndex(idx),
-    )
-
-
-def select_features_lgbm(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    target_col: str,
-    top_k: int = 32,
-    corr_threshold: float = 0.995,
-    selection_horizons: tuple[int, ...] = (1, 6, 12, 24),
-    min_forecast_weather_features: int = 8,
-) -> tuple[list[str], pd.DataFrame, dict[str, float | int]]:
-    """Rank inputs against several forecast leads using training data only.
-
-    The previous selector ranked features against the load at the same timestamp,
-    which is a different problem from multi-step forecasting. This selector sums
-    normalized LightGBM gain across representative lead times and evaluates the
-    reduced set on the matching validation targets.
-    """
-    base_cols = [c for c in train_df.columns if c != target_col]
-    if top_k < 1:
-        raise ValueError("top_k must be >= 1")
-
-    horizons = tuple(sorted({int(step) for step in selection_horizons if int(step) > 0}))
-    if not horizons:
-        raise ValueError("selection_horizons must contain at least one positive lead")
-
-    nunique = train_df[base_cols].nunique(dropna=False)
-    cols_var = nunique[nunique > 1].index.tolist()
-
-    corr = train_df[cols_var].corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    drop_corr = [col for col in upper.columns if (upper[col] > corr_threshold).any()]
-    cols_filtered = [c for c in cols_var if c not in drop_corr]
-
-    gain = pd.Series(0.0, index=cols_filtered, dtype=float)
-    full_mae: list[float] = []
-    selected_mae: list[float] = []
-
-    def make_ranker() -> lgb.LGBMRegressor:
-        return lgb.LGBMRegressor(
-            objective="l1",
-            n_estimators=500,
-            learning_rate=0.03,
-            num_leaves=48,
-            random_state=42,
-            verbosity=-1,
-        )
-
-    fitted_by_horizon: list[tuple[int, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]] = []
-    for step in horizons:
-        train_target = train_df[target_col].shift(-step).dropna()
-        val_target = val_df[target_col].shift(-step).dropna()
-        x_train = train_df.loc[train_target.index, cols_filtered]
-        x_val = val_df.loc[val_target.index, cols_filtered]
-
-        model_full = make_ranker()
-        model_full.fit(x_train, train_target)
-        pred_full = np.asarray(model_full.predict(x_val), dtype=np.float32)
-        full_mae.append(float(mean_absolute_error(val_target, pred_full)))
-
-        step_gain = pd.Series(
-            model_full.booster_.feature_importance(importance_type="gain"),
-            index=cols_filtered,
-            dtype=float,
-        )
-        if step_gain.sum() > 0:
-            gain = gain.add(step_gain / step_gain.sum(), fill_value=0.0)
-        fitted_by_horizon.append((step, x_train, train_target, x_val, val_target))
-
-    importance_df = (
-        gain.rename("gain")
-        .sort_values(ascending=False)
-        .rename_axis("feature")
-        .reset_index()
-    )
-
-    calendar_features = [
-        column
-        for column in ("hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos", "is_weekend")
-        if column in cols_filtered
-    ]
-    ranked = importance_df[importance_df["gain"] > 0]["feature"].tolist()
-    ranked_forecast_weather = [
-        column for column in ranked if column.startswith("forecast_ch_mean_")
-    ][:min_forecast_weather_features]
-
-    selected = list(dict.fromkeys([*calendar_features, *ranked_forecast_weather]))
-    for column in ranked:
-        if column not in selected:
-            selected.append(column)
-        if len(selected) >= top_k:
-            break
-    if len(selected) < min(top_k, len(cols_filtered)):
-        for column in importance_df["feature"]:
-            if column not in selected:
-                selected.append(column)
-            if len(selected) >= top_k:
-                break
-
-    for _, x_train, train_target, x_val, val_target in fitted_by_horizon:
-        model_selected = make_ranker()
-        model_selected.fit(x_train[selected], train_target)
-        pred_selected = np.asarray(model_selected.predict(x_val[selected]), dtype=np.float32)
-        selected_mae.append(float(mean_absolute_error(val_target, pred_selected)))
-
-    summary: dict[str, float | int] = {
-        "n_base": len(base_cols),
-        "n_after_variance_corr": len(cols_filtered),
-        "n_selected": len(selected),
-        "n_forecast_weather_selected": sum(
-            column.startswith("forecast_ch_mean_") for column in selected
-        ),
-        "n_calendar_selected": sum(column in calendar_features for column in selected),
-        "selection_horizon_count": len(horizons),
-        "val_mae_full_filtered": float(np.mean(full_mae)),
-        "val_mae_selected": float(np.mean(selected_mae)),
+def load_daily_samples(path: Path, config: ForecastConfig = DEFAULT_CONFIG) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Daily sample table not found: {path}")
+    samples = pd.read_parquet(path)
+    if not isinstance(samples.index, pd.DatetimeIndex):
+        samples.index = pd.to_datetime(samples.index, utc=True)
+    samples = samples.sort_index()
+    required = {
+        "split",
+        *config.history_columns,
+        *config.context_columns,
+        *config.target_columns,
     }
-    return selected, importance_df, summary
+    missing = sorted(required.difference(samples.columns))
+    if missing:
+        raise ValueError(f"Daily sample table is missing columns: {missing[:10]}")
+    return samples
 
 
-def make_sequences(
-    x: np.ndarray,
-    y: np.ndarray,
-    lookback: int,
-    horizon: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    x_seq: list[np.ndarray] = []
-    y_seq: list[np.ndarray] = []
-    for i in range(lookback, len(x) - horizon + 1):
-        x_seq.append(x[i - lookback : i])
-        y_seq.append(y[i : i + horizon])
-    return np.asarray(x_seq, dtype=np.float32), np.asarray(y_seq, dtype=np.float32)
+def _scale_fit(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    scale = values.std(axis=0, dtype=np.float64).astype(np.float32)
+    return mean, np.where(scale == 0, 1.0, scale)
 
 
-def build_data_loaders(
-    x_train_seq: np.ndarray,
-    y_train_seq: np.ndarray,
-    x_val_seq: np.ndarray,
-    y_val_seq: np.ndarray,
+def _arrays(
+    samples: pd.DataFrame,
+    config: ForecastConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    history = samples[list(config.history_columns)].to_numpy(dtype=np.float32)
+    context = samples[list(config.context_columns)].to_numpy(dtype=np.float32)
+    target = samples[list(config.target_columns)].to_numpy(dtype=np.float32)
+    return history, context, target
+
+
+def _loader(
+    history: np.ndarray,
+    context: np.ndarray,
+    target: np.ndarray,
     batch_size: int,
-) -> tuple[DataLoader[Any], DataLoader[Any]]:
-    train_loader = DataLoader(
-        TensorDataset(torch.tensor(x_train_seq), torch.tensor(y_train_seq)),
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
+    shuffle: bool,
+) -> DataLoader:
+    dataset = TensorDataset(
+        torch.tensor(history[:, :, None], dtype=torch.float32),
+        torch.tensor(context, dtype=torch.float32),
+        torch.tensor(target, dtype=torch.float32),
     )
-    val_loader = DataLoader(
-        TensorDataset(torch.tensor(x_val_seq), torch.tensor(y_val_seq)),
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
 
-def run_epoch(
+def _run_epoch(
     model: nn.Module,
-    loader: DataLoader[Any],
-    criterion: nn.Module,
+    loader: DataLoader,
+    loss_fn: nn.Module,
     device: str,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> float:
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
-
-    losses: list[float] = []
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
-
-        with torch.set_grad_enabled(is_train):
-            pred = model(xb)
-            loss = criterion(pred, yb)
-
-        if is_train:
-            assert optimizer is not None
-            optimizer.zero_grad()
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    total_rows = 0
+    for history, context, target in loader:
+        history = history.to(device)
+        context = context.to(device)
+        target = target.to(device)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        prediction = model(history, context)
+        loss = loss_fn(prediction, target)
+        if training:
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+        total_loss += float(loss.detach().cpu()) * len(history)
+        total_rows += len(history)
+    return total_loss / max(total_rows, 1)
 
-        losses.append(float(loss.item()))
 
-    return float(np.mean(losses))
-
-
-def train_model(
+def _predict(
     model: nn.Module,
-    train_loader: DataLoader[Any],
-    val_loader: DataLoader[Any],
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    history: np.ndarray,
+    context: np.ndarray,
     device: str,
-    epochs: int,
-    patience: int,
-) -> pd.DataFrame:
-    history: list[dict[str, float | int]] = []
-    best_val = float("inf")
-    best_state: dict[str, torch.Tensor] | None = None
-    wait = 0
-
-    for epoch in range(1, epochs + 1):
-        train_loss = run_epoch(model, train_loader, criterion=criterion, optimizer=optimizer, device=device)
-        val_loss = run_epoch(model, val_loader, criterion=criterion, optimizer=None, device=device)
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-
-        print(f"Epoch {epoch:02d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}")
-
-        if val_loss < best_val:
-            best_val = val_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            wait = 0
-        else:
-            wait += 1
-            if wait >= patience:
-                print("Early stopping triggered.")
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return pd.DataFrame(history)
-
-
-def predict_batched(
-    model: nn.Module,
-    x_test_seq: np.ndarray,
-    device: str,
-    infer_batch_size: int,
+    batch_size: int,
 ) -> np.ndarray:
     model.eval()
-    pred_batches: list[np.ndarray] = []
-    test_loader = DataLoader(
-        TensorDataset(torch.tensor(x_test_seq, dtype=torch.float32)),
-        batch_size=infer_batch_size,
-        shuffle=False,
-        drop_last=False,
-    )
-
+    outputs: list[np.ndarray] = []
     with torch.no_grad():
-        for (xb,) in test_loader:
-            xb = xb.to(device, non_blocking=True)
-
-            if device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    pred = model(xb)
-            else:
-                pred = model(xb)
-
-            pred_batches.append(pred.float().cpu().numpy())
-
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    return np.concatenate(pred_batches, axis=0)
+        for start in range(0, len(history), batch_size):
+            history_tensor = torch.tensor(
+                history[start : start + batch_size, :, None], dtype=torch.float32, device=device
+            )
+            context_tensor = torch.tensor(
+                context[start : start + batch_size], dtype=torch.float32, device=device
+            )
+            outputs.append(model(history_tensor, context_tensor).cpu().numpy())
+    return np.concatenate(outputs, axis=0)
 
 
-def save_model_artifacts(
-    model: nn.Module,
-    x_scaler: StandardScaler,
-    y_scaler: StandardScaler,
-    feature_cols: list[str],
-    config: LSTMTrainConfig,
-) -> Path:
-    config.model_out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_version": 2,
-            "model_state_dict": model.state_dict(),
-            "feature_cols": feature_cols,
-            "lookback": config.lookback,
-            "horizon": config.horizon,
-            "target_col": config.target_col,
-            "x_scaler_mean": x_scaler.mean_,
-            "x_scaler_scale": x_scaler.scale_,
-            "y_scaler_mean": y_scaler.mean_,
-            "y_scaler_scale": y_scaler.scale_,
-            "feature_selection_method": "multi_horizon_lightgbm_gain",
-            "selection_horizons": list(config.selection_horizons),
-            "uses_fixed_vintage_weather": any(
-                column.startswith("forecast_ch_mean_") for column in feature_cols
-            ),
-        },
-        config.model_out_path,
+def _jsonable_forecast_config(config: ForecastConfig) -> dict[str, Any]:
+    return {
+        "timezone": config.timezone,
+        "forecast_origin_hour_local": config.forecast_origin_hour_local,
+        "horizon_hours": config.horizon_hours,
+        "lookback_hours": config.lookback_hours,
+        "random_seed": config.random_seed,
+        "weather_model": config.weather_model,
+        "weather_run_hour_utc": config.weather_run_hour_utc,
+        "weather_availability_delay_hours": config.weather_availability_delay_hours,
+        "weather_variables": list(config.weather_variables),
+        "train_end": config.train_end,
+        "validation_end": config.validation_end,
+        "final_test_end": config.final_test_end,
+        "nominal_coverage": config.nominal_coverage,
+    }
+
+
+def run_training_pipeline(
+    train_config: LSTMTrainConfig | None = None,
+    forecast_config: ForecastConfig = DEFAULT_CONFIG,
+) -> dict[str, Any]:
+    cfg = train_config or LSTMTrainConfig()
+    set_deterministic_seed(forecast_config.random_seed)
+    samples = load_daily_samples(forecast_config.features_path, forecast_config)
+    train = samples[samples["split"] == "train"]
+    validation = samples[samples["split"] == "validation"]
+    final_test = samples[samples["split"] == "final_test"]
+    if min(len(train), len(validation), len(final_test)) < 1:
+        raise ValueError("Train, validation, and final-test splits must all contain daily origins")
+
+    h_train, c_train, y_train = _arrays(train, forecast_config)
+    h_val, c_val, y_val = _arrays(validation, forecast_config)
+    h_test, c_test, y_test = _arrays(final_test, forecast_config)
+
+    history_mean, history_scale = _scale_fit(h_train.reshape(-1, 1))
+    context_mean, context_scale = _scale_fit(c_train)
+    target_mean, target_scale = _scale_fit(y_train.reshape(-1, 1))
+    def scale_history(values: np.ndarray) -> np.ndarray:
+        return (values - history_mean[0]) / history_scale[0]
+
+    def scale_context(values: np.ndarray) -> np.ndarray:
+        return (values - context_mean) / context_scale
+
+    def scale_target(values: np.ndarray) -> np.ndarray:
+        return (values - target_mean[0]) / target_scale[0]
+
+    train_loader = _loader(
+        scale_history(h_train),
+        scale_context(c_train),
+        scale_target(y_train),
+        cfg.batch_size,
+        True,
     )
-    return config.model_out_path
-
-
-def run_training_pipeline(config: LSTMTrainConfig | None = None) -> dict[str, Any]:
-    cfg = config or LSTMTrainConfig()
+    val_loader = _loader(
+        scale_history(h_val),
+        scale_context(c_val),
+        scale_target(y_val),
+        cfg.batch_size,
+        False,
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
-
-    df = load_lstm_dataset(cfg.features_path, target_col=cfg.target_col)
-    train_df, val_df, test_df = split_dataset(df, train_ratio=cfg.train_ratio, val_ratio=cfg.val_ratio)
-
-    y_val_true_baseline, y_val_baseline, _ = previous_day_baseline(
-        val_df[cfg.target_col],
-        lookback=cfg.lookback,
-        horizon=cfg.horizon,
-    )
-    baseline_validation_metrics = evaluate_metrics(y_val_true_baseline, y_val_baseline)
-
-    y_test_true_baseline, y_test_baseline, _ = previous_day_baseline(
-        test_df[cfg.target_col],
-        lookback=cfg.lookback,
-        horizon=cfg.horizon,
-    )
-    baseline_test_metrics = evaluate_metrics(y_test_true_baseline, y_test_baseline)
-
-    selected_feature_cols, importance_df, fs_summary = select_features_lgbm(
-        train_df=train_df,
-        val_df=val_df,
-        target_col=cfg.target_col,
-        top_k=cfg.top_k_features,
-        corr_threshold=cfg.corr_threshold,
-        selection_horizons=cfg.selection_horizons,
-        min_forecast_weather_features=cfg.min_forecast_weather_features,
-    )
-
-    feature_cols = list(selected_feature_cols)
-    if cfg.target_col not in feature_cols:
-        feature_cols = [cfg.target_col] + feature_cols
-
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-
-    x_train = x_scaler.fit_transform(train_df[feature_cols])
-    x_val = x_scaler.transform(val_df[feature_cols])
-    x_test = x_scaler.transform(test_df[feature_cols])
-
-    y_train = y_scaler.fit_transform(train_df[[cfg.target_col]]).reshape(-1)
-    y_val = y_scaler.transform(val_df[[cfg.target_col]]).reshape(-1)
-    y_test = y_scaler.transform(test_df[[cfg.target_col]]).reshape(-1)
-
-    x_train_seq, y_train_seq = make_sequences(x_train, y_train, cfg.lookback, cfg.horizon)
-    x_val_seq, y_val_seq = make_sequences(x_val, y_val, cfg.lookback, cfg.horizon)
-    x_test_seq, y_test_seq = make_sequences(x_test, y_test, cfg.lookback, cfg.horizon)
-
-    train_loader, val_loader = build_data_loaders(
-        x_train_seq=x_train_seq,
-        y_train_seq=y_train_seq,
-        x_val_seq=x_val_seq,
-        y_val_seq=y_val_seq,
-        batch_size=cfg.batch_size,
-    )
-
-    model = LSTMRegressor(
-        input_size=len(feature_cols),
-        output_horizon=cfg.horizon,
+    model = DailyLoadLSTM(
+        context_size=len(forecast_config.context_columns),
+        horizon=forecast_config.horizon_hours,
         hidden_size=cfg.hidden_size,
         num_layers=cfg.num_layers,
         dropout=cfg.dropout,
     ).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    criterion = nn.L1Loss()
-
-    history_df = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        device=device,
-        epochs=cfg.epochs,
-        patience=cfg.patience,
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
+    loss_fn = nn.L1Loss()
 
-    y_test_pred_scaled = predict_batched(
-        model=model,
-        x_test_seq=x_test_seq,
-        device=device,
-        infer_batch_size=cfg.infer_batch_size,
-    )
+    best_state: dict[str, torch.Tensor] | None = None
+    best_val = float("inf")
+    stale_epochs = 0
+    history_rows: list[dict[str, float | int]] = []
+    for epoch in range(1, cfg.epochs + 1):
+        train_loss = _run_epoch(model, train_loader, loss_fn, device, optimizer)
+        val_loss = _run_epoch(model, val_loader, loss_fn, device)
+        history_rows.append({"epoch": epoch, "train_mae_scaled": train_loss, "val_mae_scaled": val_loss})
+        if val_loss < best_val - 1e-5:
+            best_val = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+            if stale_epochs >= cfg.patience:
+                break
+    if best_state is None:
+        raise RuntimeError("Training did not produce a model state")
+    model.load_state_dict(best_state)
 
-    y_test_true = y_scaler.inverse_transform(y_test_seq.reshape(-1, 1)).reshape(y_test_seq.shape)
-    y_test_pred_lstm = y_scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).reshape(y_test_pred_scaled.shape)
-
-    lstm_metrics = evaluate_metrics(y_test_true, y_test_pred_lstm)
-
-    compare_df = pd.DataFrame(
-        [
-            {"model": "previous_day", **baseline_test_metrics},
-            {"model": "lstm_24h", **lstm_metrics},
-        ]
-    ).sort_values("mae")
-
-    model_out_path = save_model_artifacts(
-        model=model,
-        x_scaler=x_scaler,
-        y_scaler=y_scaler,
-        feature_cols=feature_cols,
-        config=cfg,
-    )
-
-    metrics_path = model_out_path.with_suffix(".metrics.json")
-    with metrics_path.open("w", encoding="utf-8") as fp:
-        json.dump(
-            {
-                "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()},
-                "feature_selection": fs_summary,
-                "baseline": "previous_day",
-                "baseline_validation_metrics": baseline_validation_metrics,
-                "baseline_test_metrics": baseline_test_metrics,
-                "lstm_metrics": lstm_metrics,
-            },
-            fp,
-            indent=2,
+    def predict_unscaled(history: np.ndarray, context: np.ndarray) -> np.ndarray:
+        scaled = _predict(
+            model,
+            scale_history(history),
+            scale_context(context),
+            device,
+            cfg.batch_size,
         )
+        return scaled * target_scale[0] + target_mean[0]
 
+    val_pred = predict_unscaled(h_val, c_val)
+    test_pred = predict_unscaled(h_test, c_test)
+    baselines = seasonal_baselines(final_test, forecast_config)
+    chosen_aci, aci_tuning = tune_aci_on_validation(y_val, val_pred, forecast_config)
+    aci_result = rolling_aci_intervals(
+        y_val - val_pred,
+        y_test,
+        test_pred,
+        1.0 - forecast_config.nominal_coverage,
+        chosen_aci,
+    )
+
+    model_metrics = prediction_metrics(y_test, test_pred)
+    baseline_metrics = {
+        name: prediction_metrics(y_test, prediction) for name, prediction in baselines.items()
+    }
+    metrics: dict[str, Any] = {
+        "forecast_contract": _jsonable_forecast_config(forecast_config),
+        "data": {
+            "train_origins": len(train),
+            "validation_origins": len(validation),
+            "final_test_origins": len(final_test),
+            "train_start": str(train.index.min()),
+            "train_end": str(train.index.max()),
+            "validation_start": str(validation.index.min()),
+            "validation_end": str(validation.index.max()),
+            "final_test_start": str(final_test.index.min()),
+            "final_test_end": str(final_test.index.max()),
+        },
+        "features": {
+            "load_history_hours": forecast_config.lookback_hours,
+            "context_feature_count": len(forecast_config.context_columns),
+            "weather_feature_count": len(forecast_config.weather_columns),
+            "context_columns": list(forecast_config.context_columns),
+        },
+        "lstm": model_metrics,
+        "baselines": baseline_metrics,
+        "aci": {
+            "nominal_coverage": forecast_config.nominal_coverage,
+            "selected_on": "validation",
+            "config": asdict(chosen_aci),
+            "overall_coverage": aci_result["overall_coverage"],
+            "mean_interval_width": aci_result["mean_interval_width"],
+            "coverage_by_lead": aci_result["coverage_by_lead"],
+            "width_by_lead": aci_result["width_by_lead"],
+            "validation_candidates": aci_tuning.to_dict(orient="records"),
+        },
+        "training": {
+            **{key: str(value) if isinstance(value, Path) else value for key, value in asdict(cfg).items()},
+            "epochs_completed": len(history_rows),
+            "best_validation_mae_scaled": best_val,
+            "device": device,
+        },
+    }
+
+    cfg.model_out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_version": 3,
+            "model_state_dict": model.state_dict(),
+            "history_columns": list(forecast_config.history_columns),
+            "context_columns": list(forecast_config.context_columns),
+            "target_columns": list(forecast_config.target_columns),
+            "history_mean": history_mean,
+            "history_scale": history_scale,
+            "context_mean": context_mean,
+            "context_scale": context_scale,
+            "target_mean": target_mean,
+            "target_scale": target_scale,
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "dropout": cfg.dropout,
+            "forecast_config": _jsonable_forecast_config(forecast_config),
+            "aci_config": asdict(chosen_aci),
+        },
+        cfg.model_out_path,
+    )
+    metrics_path = cfg.model_out_path.with_suffix(".metrics.json")
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    comparison = pd.DataFrame(
+        [
+            {"model": "LSTM", **{key: model_metrics[key] for key in ("overall_mae", "overall_rmse")}},
+            *[
+                {
+                    "model": name.replace("_", " ").title(),
+                    **{key: values[key] for key in ("overall_mae", "overall_rmse")},
+                }
+                for name, values in baseline_metrics.items()
+            ],
+        ]
+    ).sort_values("overall_mae")
     return {
-        "config": cfg,
-        "feature_cols": feature_cols,
-        "feature_importance": importance_df,
-        "feature_selection_summary": fs_summary,
-        "history": history_df,
-        "compare": compare_df,
-        "model_out_path": model_out_path,
+        "model_out_path": cfg.model_out_path,
         "metrics_path": metrics_path,
+        "metrics": metrics,
+        "compare": comparison,
+        "training_history": pd.DataFrame(history_rows),
     }

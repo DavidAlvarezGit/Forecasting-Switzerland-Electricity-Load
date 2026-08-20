@@ -1,258 +1,232 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-SRC_ROOT = Path(__file__).resolve().parents[1]
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-if __package__ in (None, ""):
-    from helpers import find_project_root
-else:
-    from .helpers import find_project_root
+from src.forecast_config import DEFAULT_CONFIG, ForecastConfig
+from src.ingestion.openmeteo import load_weather_runs
 
 
-TARGET_COL = "load_load_mw"
-AGGREGATED_DATASET_REL_PATH = Path("data") / "interim" / "aggregated.parquet"
-LSTM_FEATURE_DATASET_REL_PATH = Path("data") / "processed" / "lstm_features.parquet"
-FORECAST_WEATHER_DATASETS = (
-    "weather_previous_runs",
-    "weather_live_forecast",
-)
-FORECAST_WEATHER_FEATURES = (
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "snowfall",
-    "cloud_cover",
-    "wind_speed_10m",
-    "surface_pressure",
-)
+def impute_load_causally(load: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Fill isolated gaps from older load only and return an audit flag."""
+    result = load.astype(float).copy()
+    was_missing = result.isna()
+    for lag in (168, 24, 1):
+        missing = result.isna()
+        if not missing.any():
+            break
+        result.loc[missing] = result.shift(lag).loc[missing]
+    return result, was_missing.astype("int8")
 
 
-def _as_datetime_index(df: pd.DataFrame) -> pd.DatetimeIndex:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("DataFrame index must be a DatetimeIndex")
-    return df.index
-
-
-def _load_aggregated(project_root: Path, input_path: str | Path | None = None) -> pd.DataFrame:
-    resolved_input = Path(input_path) if input_path is not None else project_root / AGGREGATED_DATASET_REL_PATH
-    if not resolved_input.exists():
-        raise FileNotFoundError(f"Aggregated data not found: {resolved_input}")
-
-    df = pd.read_parquet(resolved_input)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("Aggregated data must have a DatetimeIndex")
-
-    return df.sort_index()
-
-
-def _load_forecast_weather(project_root: Path) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    for source_rank, dataset in enumerate(FORECAST_WEATHER_DATASETS):
-        paths = sorted((project_root / "data" / "raw" / dataset).glob("year=*.parquet"))
-        if dataset == "weather_previous_runs" and not paths:
-            raise FileNotFoundError(
-                "No fixed-vintage weather_previous_runs data found. "
-                "Run src/ingestion/openmeteo.py before rebuilding features."
-            )
-        for path in paths:
-            frame = pd.read_parquet(path)
-            if dataset == "weather_previous_runs":
-                rename = {
-                    f"{feature}_previous_day1": feature
-                    for feature in FORECAST_WEATHER_FEATURES
-                    if f"{feature}_previous_day1" in frame.columns
-                }
-                frame = frame.rename(columns=rename)
-            frame["_source_rank"] = source_rank
-            frames.append(frame)
-
-    if not frames:
-        expected = ", ".join(FORECAST_WEATHER_DATASETS)
-        raise FileNotFoundError(f"No forecast-weather files found in: {expected}")
-
-    forecast = pd.concat(frames, ignore_index=True)
-    required = {"timestamp_utc", "city", *FORECAST_WEATHER_FEATURES}
-    missing = sorted(required.difference(forecast.columns))
-    if missing:
-        raise ValueError(f"Forecast-weather data is missing columns: {missing}")
-
-    forecast["timestamp_utc"] = pd.to_datetime(forecast["timestamp_utc"], utc=True)
-    forecast["city"] = forecast["city"].astype(str).str.lower().str.replace(" ", "_", regex=False)
-    if "retrieved_at_utc" in forecast.columns:
-        forecast["retrieved_at_utc"] = pd.to_datetime(forecast["retrieved_at_utc"], utc=True)
-        sort_columns = ["timestamp_utc", "city", "_source_rank", "retrieved_at_utc"]
-    else:
-        sort_columns = ["timestamp_utc", "city", "_source_rank"]
-
-    # Live forecasts supersede archived forecasts for the same target timestamp.
-    return (
-        forecast.sort_values(sort_columns)
-        .drop_duplicates(["timestamp_utc", "city"], keep="last")
-        .sort_values("timestamp_utc")
-    )
-
-
-def build_forecast_lead_features(
-    forecast_weather: pd.DataFrame,
-    target_index: pd.DatetimeIndex,
-    horizon: int,
-) -> pd.DataFrame:
-    """Encode target-time forecast weather on each forecast-issue row.
-
-    A row at time ``t`` receives weather forecasts for ``t + 1`` through
-    ``t + horizon``. These are forecast products, not shifted observations, so
-    future covariates can be used without looking ahead at realised weather.
-    """
-    if horizon < 1:
-        raise ValueError("horizon must be >= 1")
-
-    national = (
-        forecast_weather.groupby("timestamp_utc", sort=True)[list(FORECAST_WEATHER_FEATURES)]
-        .mean()
+def load_entsoe_series(project_root: Path) -> tuple[pd.Series, pd.Series]:
+    paths = sorted((project_root / "data" / "raw" / "entsoe").glob("swiss_load_*.parquet"))
+    if not paths:
+        raise FileNotFoundError("No ENTSO-E load partitions found")
+    raw = pd.concat((pd.read_parquet(path) for path in paths), ignore_index=True)
+    raw["timestamp_utc"] = pd.to_datetime(raw["timestamp_utc"], utc=True)
+    series = (
+        raw.sort_values("timestamp_utc")
+        .drop_duplicates("timestamp_utc", keep="last")
+        .set_index("timestamp_utc")["load_mw"]
         .sort_index()
         .asfreq("h")
     )
-    lead_columns: dict[str, pd.Series] = {}
-    for feature in FORECAST_WEATHER_FEATURES:
-        for lead in range(1, horizon + 1):
-            name = f"forecast_ch_mean_{feature}_lead_{lead:02d}"
-            lead_columns[name] = national[feature].shift(-lead).reindex(target_index)
-
-    return pd.DataFrame(lead_columns, index=target_index)
-
-
-def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    idx = _as_datetime_index(out)
-
-    out["hour"] = idx.hour
-    out["dayofweek"] = idx.dayofweek
-    out["month"] = idx.month
-    out["dayofyear"] = idx.dayofyear
-    out["is_weekend"] = (idx.dayofweek >= 5).astype(int)
-    return out
+    filled, imputed = impute_load_causally(series)
+    if filled.isna().any():
+        first_valid = filled.first_valid_index()
+        filled = filled.loc[first_valid:]
+        imputed = imputed.loc[first_valid:]
+    if filled.isna().any():
+        raise ValueError("Load still contains gaps after causal imputation")
+    return filled, imputed
 
 
-def _add_cyclical_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+def validate_weather_vintages(
+    weather: pd.DataFrame,
+    config: ForecastConfig = DEFAULT_CONFIG,
+) -> None:
+    required = {
+        "forecast_origin_utc",
+        "weather_run_utc",
+        "weather_available_utc",
+        "target_timestamp_utc",
+        "forecast_lead_hour",
+        "city",
+        "weather_model",
+        "weather_run_is_fallback",
+        "source",
+        "retrieved_at_utc",
+        *config.weather_variables,
+    }
+    missing = sorted(required.difference(weather.columns))
+    if missing:
+        raise ValueError(f"Weather-run archive is missing columns: {missing}")
+    if (weather["weather_available_utc"] > weather["forecast_origin_utc"]).any():
+        raise ValueError("Weather issued after the forecast origin was detected")
+    run_counts = weather.groupby("forecast_origin_utc")["weather_run_utc"].nunique()
+    if not run_counts.eq(1).all():
+        raise ValueError("Every forecast origin must use exactly one weather run")
+    expected_target = weather["forecast_origin_utc"] + pd.to_timedelta(
+        weather["forecast_lead_hour"], unit="h"
+    )
+    if not (expected_target == weather["target_timestamp_utc"]).all():
+        raise ValueError("Weather target timestamp and lead metadata disagree")
 
-    out["hour_sin"] = np.sin(2 * np.pi * out["hour"] / 24)
-    out["hour_cos"] = np.cos(2 * np.pi * out["hour"] / 24)
-    out["dow_sin"] = np.sin(2 * np.pi * out["dayofweek"] / 7)
-    out["dow_cos"] = np.cos(2 * np.pi * out["dayofweek"] / 7)
-    out["doy_sin"] = np.sin(2 * np.pi * out["dayofyear"] / 365.25)
-    out["doy_cos"] = np.cos(2 * np.pi * out["dayofyear"] / 365.25)
-    return out
+
+def _calendar_context(origin: pd.Timestamp, config: ForecastConfig) -> dict[str, float | int]:
+    local = origin.tz_convert(config.timezone)
+    dow = local.dayofweek
+    doy = local.dayofyear
+    return {
+        "dow_sin": float(np.sin(2 * np.pi * dow / 7)),
+        "dow_cos": float(np.cos(2 * np.pi * dow / 7)),
+        "doy_sin": float(np.sin(2 * np.pi * doy / 365.25)),
+        "doy_cos": float(np.cos(2 * np.pi * doy / 365.25)),
+        "is_weekend": int(dow >= 5),
+    }
 
 
-def _add_load_lag_features(df: pd.DataFrame, target_col: str, lags: list[int]) -> pd.DataFrame:
-    out = df.copy()
-    for lag in lags:
-        out[f"{target_col}_lag_{lag}"] = out[target_col].shift(lag)
-    return out
+def _split_name(origin: pd.Timestamp, config: ForecastConfig) -> str:
+    if origin <= pd.Timestamp(config.train_end):
+        return "train"
+    if origin <= pd.Timestamp(config.validation_end):
+        return "validation"
+    if origin <= pd.Timestamp(config.final_test_end):
+        return "final_test"
+    return "future"
 
 
-def _add_load_rolling_features(df: pd.DataFrame, target_col: str, windows: list[int]) -> pd.DataFrame:
-    out = df.copy()
-    shifted = out[target_col].shift(1)
-
-    for window in windows:
-        roll = shifted.rolling(window=window, min_periods=window)
-        out[f"{target_col}_roll_mean_{window}"] = roll.mean()
-        out[f"{target_col}_roll_std_{window}"] = roll.std()
-    return out
-
-
-def build_lstm_feature_table(
-    aggregated_df: pd.DataFrame,
-    target_col: str = TARGET_COL,
-    lags: list[int] | None = None,
-    rolling_windows: list[int] | None = None,
-    keep_raw_calendar: bool = False,
-    forecast_weather: pd.DataFrame | None = None,
-    forecast_horizon: int = 24,
+def build_daily_forecast_samples(
+    load: pd.Series,
+    load_was_imputed: pd.Series,
+    weather: pd.DataFrame,
+    config: ForecastConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
-    if target_col not in aggregated_df.columns:
-        raise ValueError(f"Target column not found in aggregated data: {target_col}")
+    """Create one point-in-time-correct 24-hour sample per local day."""
+    validate_weather_vintages(weather, config)
+    national = (
+        weather.groupby(
+            [
+                "forecast_origin_utc",
+                "weather_run_utc",
+                "weather_available_utc",
+                "weather_model",
+                "weather_run_is_fallback",
+                "source",
+                "retrieved_at_utc",
+                "forecast_lead_hour",
+                "target_timestamp_utc",
+            ],
+            sort=True,
+        )[list(config.weather_variables)]
+        .mean()
+        .reset_index()
+    )
 
-    lag_values = lags or [1, 2, 3, 6, 12, 24, 48, 72, 168]
-    window_values = rolling_windows or [24, 168]
+    rows: list[dict[str, object]] = []
+    for origin, run_frame in national.groupby("forecast_origin_utc", sort=True):
+        origin = pd.Timestamp(origin).tz_convert("UTC")
+        run_frame = run_frame.sort_values("forecast_lead_hour")
+        expected_leads = np.arange(1, config.horizon_hours + 1)
+        if not np.array_equal(run_frame["forecast_lead_hour"].to_numpy(), expected_leads):
+            continue
 
-    features = aggregated_df.copy()
-    features = _add_calendar_features(features)
-    features = _add_cyclical_features(features)
-    features = _add_load_lag_features(features, target_col=target_col, lags=lag_values)
-    features = _add_load_rolling_features(features, target_col=target_col, windows=window_values)
-
-    if forecast_weather is not None:
-        forecast_features = build_forecast_lead_features(
-            forecast_weather,
-            target_index=_as_datetime_index(features),
-            horizon=forecast_horizon,
+        history_index = pd.date_range(
+            origin - pd.Timedelta(hours=config.lookback_hours - 1),
+            origin,
+            freq="h",
+            tz="UTC",
         )
-        features = features.join(forecast_features, how="left")
+        target_index = pd.date_range(
+            origin + pd.Timedelta(hours=1),
+            periods=config.horizon_hours,
+            freq="h",
+            tz="UTC",
+        )
+        if not history_index.isin(load.index).all() or not target_index.isin(load.index).all():
+            continue
 
-    if not keep_raw_calendar:
-        # Cyclical calendar features are enough for sequence models and reduce redundancy.
-        features = features.drop(columns=["hour", "dayofweek", "month", "dayofyear"], errors="ignore")
+        history = load.reindex(history_index)
+        targets = load.reindex(target_index)
+        if history.isna().any() or targets.isna().any():
+            continue
 
-    features = features.dropna().sort_index()
-    return features
+        row: dict[str, object] = {
+            "forecast_origin_local": origin.tz_convert(config.timezone).isoformat(),
+            "weather_run_utc": run_frame["weather_run_utc"].iloc[0],
+            "weather_available_utc": run_frame["weather_available_utc"].iloc[0],
+            "weather_model": run_frame["weather_model"].iloc[0],
+            "weather_run_is_fallback": bool(run_frame["weather_run_is_fallback"].iloc[0]),
+            "weather_source": run_frame["source"].iloc[0],
+            "weather_retrieved_at_utc": run_frame["retrieved_at_utc"].iloc[0],
+            "target_start_utc": target_index[0],
+            "target_end_utc": target_index[-1],
+            "split": _split_name(origin, config),
+            "load_history_imputed_count": int(load_was_imputed.reindex(history_index).sum()),
+            "load_lag_24": float(load.loc[origin - pd.Timedelta(hours=24)]),
+            "load_lag_168": float(load.loc[origin - pd.Timedelta(hours=168)]),
+            "load_roll_mean_24": float(history.iloc[-24:].mean()),
+            "load_roll_std_24": float(history.iloc[-24:].std()),
+            "load_roll_mean_168": float(history.iloc[-168:].mean()),
+            "load_roll_std_168": float(history.iloc[-168:].std()),
+            **_calendar_context(origin, config),
+        }
+        for lag, value in enumerate(history.iloc[::-1]):
+            row[f"load_history_lag_{lag:03d}"] = float(value)
+        for _, weather_row in run_frame.iterrows():
+            lead = int(weather_row["forecast_lead_hour"])
+            for variable in config.weather_variables:
+                row[f"weather_{variable}_lead_{lead:02d}"] = float(weather_row[variable])
+        for lead, value in enumerate(targets, start=1):
+            row[f"target_load_lead_{lead:02d}"] = float(value)
+        rows.append({"forecast_origin_utc": origin, **row})
+
+    samples = pd.DataFrame(rows).set_index("forecast_origin_utc").sort_index()
+    required_numeric = [*config.history_columns, *config.context_columns, *config.target_columns]
+    if samples.empty:
+        raise ValueError("No complete daily forecast samples could be constructed")
+    if samples[required_numeric].isna().any().any():
+        raise ValueError("Daily forecast samples contain missing model values")
+    if samples.index.tz is None or samples.index.has_duplicates:
+        raise ValueError("Forecast origins must be unique and timezone-aware")
+    local = samples.index.tz_convert(config.timezone)
+    if not (local.hour == config.forecast_origin_hour_local).all():
+        raise ValueError("A sample does not use the configured local forecast hour")
+    return samples
 
 
 def run_feature_pipeline(
-    input_path: str | Path | None = None,
     output_path: str | Path | None = None,
-    target_col: str = TARGET_COL,
+    config: ForecastConfig = DEFAULT_CONFIG,
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
-    project_root = find_project_root(Path.cwd().resolve())
-    aggregated_df = _load_aggregated(project_root, input_path)
-    forecast_weather = _load_forecast_weather(project_root)
-    lstm_df = build_lstm_feature_table(
-        aggregated_df,
-        target_col=target_col,
-        forecast_weather=forecast_weather,
-    )
-
-    resolved_output = (
-        Path(output_path)
-        if output_path is not None
-        else project_root / LSTM_FEATURE_DATASET_REL_PATH
-    )
-
-    resolved_output.parent.mkdir(parents=True, exist_ok=True)
-    lstm_df.to_parquet(resolved_output)
-
-    meta: dict[str, int | str] = {
-        "model": "lstm",
-        "rows": int(len(lstm_df)),
-        "columns": int(lstm_df.shape[1]),
-        "forecast_weather_columns": sum(
-            column.startswith("forecast_ch_mean_") for column in lstm_df.columns
-        ),
-        "start": str(lstm_df.index.min()),
-        "end": str(lstm_df.index.max()),
-        "output_path": str(resolved_output),
+    project_root = config.features_path.parents[2]
+    load, imputed = load_entsoe_series(project_root)
+    weather = load_weather_runs(config)
+    if weather.empty:
+        raise FileNotFoundError(
+            "No weather forecast runs found. Run `python -m src.ingestion.openmeteo` first."
+        )
+    samples = build_daily_forecast_samples(load, imputed, weather, config)
+    resolved = Path(output_path) if output_path is not None else config.features_path
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    samples.to_parquet(resolved)
+    metadata: dict[str, int | str] = {
+        "rows": len(samples),
+        "columns": samples.shape[1],
+        "history_hours": config.lookback_hours,
+        "context_features": len(config.context_columns),
+        "weather_features": len(config.weather_columns),
+        "start": str(samples.index.min()),
+        "end": str(samples.index.max()),
+        "output_path": str(resolved),
     }
-    return lstm_df, meta
-
-
-def main() -> None:
-    feature_df, meta = run_feature_pipeline()
-    print(
-        f"LSTM feature dataset: {meta['start']} -> {meta['end']} | "
-        f"rows={meta['rows']} cols={meta['columns']}"
-    )
-    print(f"Feature output: {meta['output_path']}")
-    print(feature_df.head(5))
+    return samples, metadata
 
 
 if __name__ == "__main__":
-    main()
+    frame, summary = run_feature_pipeline()
+    print(summary)
+    print(frame[["forecast_origin_local", "weather_run_utc", "split"]].tail())
