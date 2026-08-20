@@ -60,7 +60,7 @@ def load_lstm_artifact(
     except TypeError:
         checkpoint = torch.load(resolved, map_location=run_device)
     if int(checkpoint.get("model_version", 0)) < 3:
-        raise ValueError("This dashboard requires the daily-origin model artifact (version 3).")
+        raise ValueError("This dashboard requires a point-in-time model artifact (version 3 or newer).")
 
     context_columns = list(checkpoint["context_columns"])
     target_columns = list(checkpoint["target_columns"])
@@ -100,16 +100,10 @@ def load_lstm_artifact(
 
 def _validate_samples(samples: pd.DataFrame, artifact: LoadedLSTMArtifact) -> pd.DataFrame:
     if not isinstance(samples.index, pd.DatetimeIndex):
-        raise ValueError("Daily samples must have a DatetimeIndex of forecast origins")
+        raise ValueError("Hourly samples must have a DatetimeIndex of forecast origins")
     missing = [column for column in artifact.feature_cols if column not in samples.columns]
     if missing:
         raise ValueError(f"Missing model inputs: {missing[:10]}")
-    local_hours = samples.index.tz_convert(
-        artifact.forecast_config.get("timezone", "Europe/Zurich")
-    ).hour
-    expected_hour = int(artifact.forecast_config.get("forecast_origin_hour_local", 12))
-    if not (local_hours == expected_hour).all():
-        raise ValueError("Samples contain an origin outside the configured local issue hour")
     return samples.sort_index()
 
 
@@ -167,8 +161,12 @@ def forecast_next_horizon_with_intervals(
     point = forecast_next_horizon(frame, artifact)
     calibration = frame.iloc[:-1]
     calibration = calibration[calibration[artifact.target_columns].notna().all(axis=1)]
+    if "target_end_utc" in calibration:
+        calibration = calibration[
+            pd.to_datetime(calibration["target_end_utc"], utc=True) <= frame.index[-1]
+        ]
     if calibration.empty:
-        raise ValueError("No completed daily forecasts are available for ACI calibration")
+        raise ValueError("No completed hourly forecasts are available for ACI calibration")
     prediction = _predict_rows(calibration, artifact)
     actual = calibration[artifact.target_columns].to_numpy(dtype=np.float32)
     calibrator = AdaptiveConformalCalibrator(artifact.horizon, alpha_value, artifact.aci_config)
@@ -222,12 +220,12 @@ def evaluate_recent_backtest(
     history_windows: int = 120,
     **_: Any,
 ) -> dict[str, Any]:
-    """Evaluate only daily origins, with validation residuals seeding final-test ACI."""
+    """Evaluate hourly origins, with validation residuals seeding final-test ACI."""
     frame = _validate_samples(samples, artifact)
     validation = frame[frame["split"] == "validation"]
     evaluation = frame[frame["split"] == "final_test"].tail(eval_windows)
     if validation.empty or evaluation.empty:
-        raise ValueError("Validation and final-test daily origins are required")
+        raise ValueError("Validation and final-test hourly origins are required")
     val_true = validation[artifact.target_columns].to_numpy(dtype=np.float32)
     eval_true = evaluation[artifact.target_columns].to_numpy(dtype=np.float32)
     val_pred = _predict_rows(validation, artifact)
@@ -244,6 +242,9 @@ def evaluate_recent_backtest(
         eval_pred,
         alpha_value,
         artifact.aci_config,
+        calibration_target_ends=pd.DatetimeIndex(validation["target_end_utc"]),
+        evaluation_origins=evaluation.index,
+        evaluation_target_ends=pd.DatetimeIndex(evaluation["target_end_utc"]),
     )
     model_metrics = prediction_metrics(eval_true, eval_pred)
     baseline_metrics = {

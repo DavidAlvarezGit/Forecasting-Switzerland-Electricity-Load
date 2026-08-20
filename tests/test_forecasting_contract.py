@@ -5,9 +5,8 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
-import torch
 
-from src.forecast_config import DEFAULT_CONFIG, daily_origins
+from src.forecast_config import DEFAULT_CONFIG, daily_origins, hourly_origins
 from src.modeling.evaluation import (
     ACIConfig,
     AdaptiveConformalCalibrator,
@@ -15,7 +14,6 @@ from src.modeling.evaluation import (
     rolling_aci_intervals,
     seasonal_baselines,
 )
-from src.modeling.lstm_pipeline import DailyLoadLSTM
 from src.processing.features import (
     build_daily_forecast_samples,
     impute_load_causally,
@@ -37,19 +35,26 @@ class ForecastOriginTests(unittest.TestCase):
             run = DEFAULT_CONFIG.weather_run_for_origin(origin)
             self.assertLessEqual(DEFAULT_CONFIG.weather_available_at(run), origin)
 
+    def test_hourly_origins_follow_real_hours_across_dst(self) -> None:
+        spring = hourly_origins("2025-03-30", "2025-03-30")
+        autumn = hourly_origins("2025-10-26", "2025-10-26")
+        self.assertEqual(len(spring), 23)
+        self.assertEqual(len(autumn), 25)
+        self.assertTrue((spring.to_series().diff().dropna() == pd.Timedelta(hours=1)).all())
+
 
 class PointInTimeWeatherTests(unittest.TestCase):
     def _weather(self, origin: pd.Timestamp, config=DEFAULT_CONFIG) -> pd.DataFrame:
         rows = []
         run = config.weather_run_for_origin(origin)
-        for lead in range(1, config.horizon_hours + 1):
+        for lead in range(config.weather_archive_hours):
             for city_number, city in enumerate(("zurich", "geneva")):
                 rows.append(
                     {
                         "forecast_origin_utc": origin,
                         "weather_run_utc": run,
                         "weather_available_utc": config.weather_available_at(run),
-                        "target_timestamp_utc": origin + pd.Timedelta(hours=lead),
+                        "target_timestamp_utc": run + pd.Timedelta(hours=lead),
                         "forecast_lead_hour": lead,
                         "city": city,
                         "weather_model": config.weather_model,
@@ -81,11 +86,14 @@ class PointInTimeWeatherTests(unittest.TestCase):
 
         samples = build_daily_forecast_samples(load, imputed, weather, config)
 
-        self.assertEqual(len(samples), 1)
-        self.assertEqual(samples.index[0], origin)
-        self.assertEqual(samples.iloc[0]["target_load_lead_01"], load.loc[origin + pd.Timedelta(hours=1)])
-        self.assertEqual(samples.iloc[0]["target_load_lead_24"], load.loc[origin + pd.Timedelta(hours=24)])
-        self.assertEqual(samples.iloc[0]["weather_temperature_2m_lead_24"], 24.5)
+        self.assertIn(origin, samples.index)
+        self.assertEqual(samples.loc[origin]["target_load_lead_01"], load.loc[origin + pd.Timedelta(hours=1)])
+        self.assertEqual(samples.loc[origin]["target_load_lead_24"], load.loc[origin + pd.Timedelta(hours=24)])
+        model_lead = int(
+            (origin + pd.Timedelta(hours=24) - config.weather_run_for_origin(origin))
+            / pd.Timedelta(hours=1)
+        )
+        self.assertEqual(samples.loc[origin]["weather_temperature_2m_lead_24"], model_lead + 0.5)
 
 
 class CausalLoadTests(unittest.TestCase):
@@ -141,20 +149,33 @@ class EvaluationTests(unittest.TestCase):
             prediction,
             alpha=0.1,
             aci_config=ACIConfig(eta=0.05, window_size=2, per_horizon=True),
+            calibration_target_ends=pd.DatetimeIndex(["2025-01-01", "2025-01-02"], tz="UTC"),
+            evaluation_origins=pd.DatetimeIndex(["2025-01-03", "2025-01-04"], tz="UTC"),
+            evaluation_target_ends=pd.DatetimeIndex(["2025-01-04", "2025-01-05"], tz="UTC"),
         )
         first_width = result["upper"][0] - result["lower"][0]
         second_width = result["upper"][1] - result["lower"][1]
         np.testing.assert_allclose(first_width, np.asarray([2.0, 2.0]))
         self.assertTrue(np.all(second_width > first_width))
 
-    def test_daily_lstm_output_shape_is_24_hours(self) -> None:
-        model = DailyLoadLSTM(context_size=5, horizon=24, hidden_size=8)
-        output = model(
-            history=torch.zeros((2, 336, 1)),
-            context=torch.zeros((2, 5)),
+    def test_aci_waits_for_target_end_across_spring_dst(self) -> None:
+        origins = daily_origins("2025-03-29", "2025-03-31")
+        target_ends = origins + pd.Timedelta(hours=24)
+        result = rolling_aci_intervals(
+            np.ones((2, 2), dtype=float),
+            np.asarray([[100.0, 100.0], [0.0, 0.0], [0.0, 0.0]]),
+            np.zeros((3, 2), dtype=float),
+            alpha=0.1,
+            aci_config=ACIConfig(eta=0.05, window_size=2, per_horizon=True),
+            calibration_target_ends=pd.DatetimeIndex(
+                [origins[0] - pd.Timedelta(days=2), origins[0] - pd.Timedelta(days=1)]
+            ),
+            evaluation_origins=origins,
+            evaluation_target_ends=target_ends,
         )
-        self.assertEqual(tuple(output.shape), (2, 24))
-
+        widths = result["upper"] - result["lower"]
+        np.testing.assert_allclose(widths[1], widths[0])
+        self.assertTrue(np.all(widths[2] > widths[1]))
 
 if __name__ == "__main__":
     unittest.main()

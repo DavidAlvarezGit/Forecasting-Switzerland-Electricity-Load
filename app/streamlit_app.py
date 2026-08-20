@@ -19,9 +19,9 @@ from src.modeling import inference as inference_mod  # noqa: E402
 
 DEFAULT_MODEL_PATH = "data/processed/models/daily_lstm_24h.pt"
 DEFAULT_FEATURES_PATH = "data/processed/daily_forecast_samples.parquet"
-EVALUATION_ORIGINS = 120
-HISTORY_ORIGINS = 30
-RESULTS_CACHE_VERSION = 3
+EVALUATION_ORIGINS = 120 * 24
+HISTORY_ORIGINS = 30 * 24
+RESULTS_CACHE_VERSION = 4
 
 RED = "#D52B1E"
 BLUE = "#1769AA"
@@ -120,12 +120,15 @@ def _styles() -> None:
 def _hero(results: DashboardResults) -> None:
     metadata = results.metadata
     origin = escape(_time(metadata["latest_origin"], metadata["timezone"]))
+    frequency = metadata["forecast_frequency"]
+    title = "Hourly" if frequency == "hourly" else "Daily"
+    schedule = "latest complete hourly origin" if frequency == "hourly" else "latest noon origin"
     st.markdown(
         f"""
         <div class="hero">
           <div class="eyebrow">Swiss grid outlook</div>
-          <h1>Daily electricity load forecast</h1>
-          <p>This archived forecast was issued at noon in Zurich. The model predicts the following
+          <h1>{title} electricity load forecast</h1>
+          <p>This forecast uses the {schedule}. The model predicts the following
           24 hourly demand values using load known at issuance and one auditable weather-model run.</p>
           <span class="chip">Forecast origin: {origin}</span>
           <span class="chip">24 hourly leads</span>
@@ -190,8 +193,8 @@ def _performance_chart(results: DashboardResults) -> alt.Chart | None:
     }
     if history.empty or not required.issubset(history.columns):
         return None
-    # Fixed local-time origins can overlap once at the spring DST transition.
-    # Keep the later origin for a readable chart; metrics retain every origin/lead pair.
+    # Hourly forecast windows overlap by design. Keep the latest forecast for each
+    # target timestamp in the chart; metrics retain every origin/lead pair.
     plot = (
         history.reset_index(names="timestamp")
         .sort_values(["timestamp", "forecast_origin_utc"])
@@ -248,7 +251,7 @@ def _forecast_tab(results: DashboardResults, context_hours: int) -> None:
         st.download_button(
             "Download forecast CSV",
             table.to_csv().encode("utf-8"),
-            "switzerland_daily_load_forecast.csv",
+            "switzerland_hourly_load_forecast.csv",
             "text/csv",
             use_container_width=True,
         )
@@ -261,8 +264,10 @@ def _performance_tab(results: DashboardResults) -> None:
         return
     st.markdown('<p class="kicker">Untouched final test</p>', unsafe_allow_html=True)
     st.subheader("Rolling-origin performance")
+    frequency = results.metadata["forecast_frequency"]
+    cadence = "every hour" if frequency == "hourly" else "once per day"
     st.caption(
-        "One forecast is evaluated per day. The LSTM is compared with the same hours "
+        f"One forecast is evaluated {cadence}. The LSTM is compared with the same hours "
         "yesterday and the same hours last week. Smaller errors are better."
     )
     baselines = metrics["baseline_metrics"]
@@ -294,11 +299,11 @@ def _performance_tab(results: DashboardResults) -> None:
     with right:
         st.markdown("#### Evaluation details")
         aci = metrics["aci_config"]
-        st.write(f"**Daily test forecasts:** {metrics['n_eval_windows']:,}")
+        st.write(f"**Test forecasts:** {metrics['n_eval_windows']:,}")
         st.write(f"**Validation forecasts for ranges:** {metrics['n_calibration_windows']:,}")
         st.write(f"**Target coverage:** {metrics['target_coverage']:.0%}")
         st.write(f"**Average range width:** {_mw(metrics['mean_interval_width'], 1)}")
-        st.write(f"**Adjustment speed / memory:** {aci['eta']:.3f} / {aci['window_size']} days")
+        st.write(f"**Adjustment speed / memory:** {aci['eta']:.3f} / {aci['window_size']} forecasts")
         st.caption(
             "The adaptive conformal inference (ACI) settings were chosen on validation data only."
         )
@@ -315,7 +320,8 @@ def _data_tab(
     st.subheader("Data and model")
     left, right = st.columns(2)
     with left:
-        st.metric("Daily forecast origins", f"{metadata['dataset_rows']:,}")
+        label = "Hourly forecast origins" if metadata["forecast_frequency"] == "hourly" else "Daily forecast origins"
+        st.metric(label, f"{metadata['dataset_rows']:,}")
         st.write(f"**Origin range:** {_time(metadata['dataset_start'])} → {_time(metadata['dataset_end'])}")
         st.write(f"**Split counts:** {metadata['split_counts']}")
         st.write(f"**Latest weather run:** {_time(metadata['latest_weather_run'], 'UTC')} UTC")
@@ -324,7 +330,8 @@ def _data_tab(
         st.write(f"**Archived on:** {_time(metadata['latest_weather_retrieved'], 'UTC')} UTC")
     with right:
         st.metric("Forecast horizon", f"{metadata['horizon']} hours")
-        st.write(f"**Forecast origin:** {metadata['forecast_origin_hour_local']:02d}:00 {metadata['timezone']}")
+        schedule = "Every hour" if metadata["forecast_frequency"] == "hourly" else "Daily at noon"
+        st.write(f"**Forecast schedule:** {schedule} ({metadata['timezone']})")
         st.write(f"**Load history:** {metadata['lookback']} hours")
         st.write(f"**Context inputs:** {metadata['feature_count']}")
         st.write(f"**Weather inputs:** {metadata['forecast_weather_feature_count']}")
@@ -351,10 +358,10 @@ def main() -> None:
     _styles()
     with st.sidebar:
         st.markdown("## ⚡ Swiss Load Outlook")
-        st.caption("One daily forecast at 12:00 Europe/Zurich")
+        st.caption("Rolling 24-hour electricity forecasts")
         with st.expander("Files"):
             model_value = st.text_input("Model", DEFAULT_MODEL_PATH)
-            samples_value = st.text_input("Daily samples", DEFAULT_FEATURES_PATH)
+            samples_value = st.text_input("Hourly samples", DEFAULT_FEATURES_PATH)
         context_hours = st.slider("Observed history to show", 24, 24 * 14, 24 * 7, step=24)
         include_intervals = st.checkbox("Show forecast range", value=True)
         st.caption("Range settings are fixed from validation and cannot be tuned on this dashboard.")
@@ -367,7 +374,7 @@ def main() -> None:
     model_path = _path(model_value)
     samples_path = _path(samples_value)
     if not model_path.is_file() or not samples_path.is_file():
-        st.error("The model or daily sample file is missing.")
+        st.error("The model or hourly sample file is missing.")
         st.code(
             "poetry run python -m src.processing.processing\n"
             "poetry run python -m src.modeling.train_lstm",

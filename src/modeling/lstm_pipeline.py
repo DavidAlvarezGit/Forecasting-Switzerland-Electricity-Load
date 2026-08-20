@@ -24,13 +24,13 @@ from src.modeling.evaluation import (
 
 @dataclass(slots=True)
 class LSTMTrainConfig:
-    batch_size: int = 64
-    epochs: int = 80
+    batch_size: int = 256
+    epochs: int = 30
     learning_rate: float = 1e-3
     hidden_size: int = 64
     num_layers: int = 1
     dropout: float = 0.15
-    patience: int = 10
+    patience: int = 5
     weight_decay: float = 1e-4
     model_out_path: Path = DEFAULT_CONFIG.model_path
 
@@ -181,6 +181,8 @@ def _jsonable_forecast_config(config: ForecastConfig) -> dict[str, Any]:
         "weather_model": config.weather_model,
         "weather_run_hour_utc": config.weather_run_hour_utc,
         "weather_availability_delay_hours": config.weather_availability_delay_hours,
+        "weather_archive_hours": config.weather_archive_hours,
+        "forecast_frequency": "hourly",
         "weather_variables": list(config.weather_variables),
         "train_end": config.train_end,
         "validation_end": config.validation_end,
@@ -200,7 +202,7 @@ def run_training_pipeline(
     validation = samples[samples["split"] == "validation"]
     final_test = samples[samples["split"] == "final_test"]
     if min(len(train), len(validation), len(final_test)) < 1:
-        raise ValueError("Train, validation, and final-test splits must all contain daily origins")
+        raise ValueError("Train, validation, and final-test splits must all contain hourly origins")
 
     h_train, c_train, y_train = _arrays(train, forecast_config)
     h_val, c_val, y_val = _arrays(validation, forecast_config)
@@ -278,13 +280,22 @@ def run_training_pipeline(
     val_pred = predict_unscaled(h_val, c_val)
     test_pred = predict_unscaled(h_test, c_test)
     baselines = seasonal_baselines(final_test, forecast_config)
-    chosen_aci, aci_tuning = tune_aci_on_validation(y_val, val_pred, forecast_config)
+    chosen_aci, aci_tuning = tune_aci_on_validation(
+        y_val,
+        val_pred,
+        validation.index,
+        pd.DatetimeIndex(validation["target_end_utc"]),
+        forecast_config,
+    )
     aci_result = rolling_aci_intervals(
         y_val - val_pred,
         y_test,
         test_pred,
         1.0 - forecast_config.nominal_coverage,
         chosen_aci,
+        calibration_target_ends=pd.DatetimeIndex(validation["target_end_utc"]),
+        evaluation_origins=final_test.index,
+        evaluation_target_ends=pd.DatetimeIndex(final_test["target_end_utc"]),
     )
 
     model_metrics = prediction_metrics(y_test, test_pred)
@@ -333,7 +344,7 @@ def run_training_pipeline(
     cfg.model_out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_version": 3,
+            "model_version": 4,
             "model_state_dict": model.state_dict(),
             "history_columns": list(forecast_config.history_columns),
             "context_columns": list(forecast_config.context_columns),

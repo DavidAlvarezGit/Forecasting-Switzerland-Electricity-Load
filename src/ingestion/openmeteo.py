@@ -32,6 +32,10 @@ class ModelRunUnavailable(RuntimeError):
     """Raised when the archive explicitly reports a missing model run."""
 
 
+class WeatherRateLimitError(RuntimeError):
+    """Raised immediately so a checkpointed refresh does not amplify HTTP 429 responses."""
+
+
 def _request_json(
     params: dict[str, Any],
     retries: int = 5,
@@ -40,11 +44,17 @@ def _request_json(
     for attempt in range(retries):
         try:
             response = requests.get(SINGLE_RUNS_URL, params=params, timeout=timeout_seconds)
+            if response.status_code == 429:
+                raise WeatherRateLimitError(
+                    "Open-Meteo rate limit reached; saved checkpoints can be resumed later"
+                )
             response.raise_for_status()
             if "modelRunUnavailable" in response.text:
                 raise ModelRunUnavailable(response.text)
             payload = response.json()
             return payload if isinstance(payload, list) else [payload]
+        except WeatherRateLimitError:
+            raise
         except (requests.RequestException, ValueError):
             if attempt == retries - 1:
                 raise
@@ -63,7 +73,7 @@ def _request_params(
         "hourly": list(config.weather_variables),
         "models": config.weather_model,
         "run": run_utc.strftime("%Y-%m-%dT%H:%M"),
-        "forecast_hours": 192,
+        "forecast_hours": config.weather_archive_hours,
         "timezone": "UTC",
     }
 
@@ -95,11 +105,12 @@ def _payload_is_complete(
         hourly = location.get("hourly", {})
         timestamps = pd.to_datetime(hourly.get("time", []), utc=True)
         positions = np.flatnonzero(timestamps.isin(target_index))
-        if len(positions) != config.horizon_hours:
+        if len(positions) != config.weather_archive_hours:
             return False
         for variable in config.weather_variables:
             values = pd.to_numeric(pd.Series(hourly.get(variable, [])), errors="coerce")
-            if len(values) <= int(positions.max()) or values.iloc[positions].isna().any():
+            required_positions = positions[timestamps[positions] > timestamps.min()]
+            if len(values) <= int(positions.max()) or values.iloc[required_positions].isna().any():
                 return False
     return True
 
@@ -108,14 +119,8 @@ def fetch_weather_run(
     forecast_origin_utc: pd.Timestamp,
     config: ForecastConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
-    """Fetch one complete weather vintage available at a daily forecast origin."""
+    """Archive enough of one weather vintage to serve every hourly origin."""
     origin = pd.Timestamp(forecast_origin_utc).tz_convert("UTC")
-    target_index = pd.date_range(
-        origin + pd.Timedelta(hours=1),
-        periods=config.horizon_hours,
-        freq="h",
-        tz="UTC",
-    )
     scheduled_run = config.weather_run_for_origin(origin)
     candidate_runs = tuple(
         scheduled_run - pd.Timedelta(hours=offset)
@@ -125,6 +130,12 @@ def fetch_weather_run(
     last_error: Exception | None = None
     run_utc: pd.Timestamp | None = None
     for candidate in candidate_runs:
+        target_index = pd.date_range(
+            candidate,
+            periods=config.weather_archive_hours,
+            freq="h",
+            tz="UTC",
+        )
         try:
             payload = _request_run(candidate, config)
             if not _payload_is_complete(payload, target_index, config):
@@ -138,12 +149,21 @@ def fetch_weather_run(
                 raise ValueError(f"Weather run {candidate} has incomplete target values")
             run_utc = candidate
             break
+        except WeatherRateLimitError:
+            raise
         except (requests.RequestException, ValueError, RuntimeError) as error:
             last_error = error
     if payload is None or run_utc is None:
         raise RuntimeError(
             f"No complete weather run from the scheduled or ten preceding cycles is available for {origin}"
         ) from last_error
+
+    target_index = pd.date_range(
+        run_utc,
+        periods=config.weather_archive_hours,
+        freq="h",
+        tz="UTC",
+    )
 
     available_utc = config.weather_available_at(run_utc)
     if available_utc > origin:
@@ -180,17 +200,17 @@ def fetch_weather_run(
     result["weather_run_is_fallback"] = run_utc != scheduled_run
     result["weather_available_utc"] = available_utc
     result["forecast_lead_hour"] = (
-        (result["target_timestamp_utc"] - origin) / pd.Timedelta(hours=1)
+        (result["target_timestamp_utc"] - run_utc) / pd.Timedelta(hours=1)
     ).astype("int16")
     result["weather_model"] = config.weather_model
     result["source"] = SOURCE_NAME
     result["source_url"] = SINGLE_RUNS_URL
     result["retrieved_at_utc"] = retrieved_at
 
-    expected_rows = len(CITIES) * config.horizon_hours
+    expected_rows = len(CITIES) * config.weather_archive_hours
     if len(result) != expected_rows:
         raise ValueError(f"Expected {expected_rows} run rows, received {len(result)}")
-    if not result["forecast_lead_hour"].between(1, config.horizon_hours).all():
+    if not result["forecast_lead_hour"].between(0, config.weather_archive_hours - 1).all():
         raise ValueError("Weather run contains targets outside the configured horizon")
     if not (result["weather_available_utc"] <= result["forecast_origin_utc"]).all():
         raise ValueError("A weather value was issued after its forecast origin")
@@ -253,11 +273,12 @@ def ingest_weather_forecast_runs(
     existing = load_weather_runs(config)
     existing_origins: set[pd.Timestamp] = set()
     if not existing.empty:
-        expected_rows = len(CITIES) * config.horizon_hours
+        expected_rows = len(CITIES) * config.weather_archive_hours
         grouped = existing.groupby("forecast_origin_utc")
+        minimum_values = expected_rows - len(CITIES)
         complete = grouped.size().eq(expected_rows) & grouped[
             list(config.weather_variables)
-        ].count().eq(expected_rows).all(axis=1)
+        ].count().ge(minimum_values).all(axis=1)
         existing_origins = set(pd.DatetimeIndex(complete[complete].index))
     missing = [origin for origin in origins if origin not in existing_origins]
     if not missing:
@@ -267,32 +288,38 @@ def ingest_weather_forecast_runs(
     completed_total = 0
     for attempt in range(1, 4):
         failed: list[pd.Timestamp] = []
-        checkpoint: list[pd.DataFrame] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(fetch_weather_run, origin, config): origin for origin in pending
-            }
-            for future in as_completed(futures):
-                origin = futures[future]
-                try:
-                    checkpoint.append(future.result())
-                    completed_total += 1
-                except (requests.RequestException, ValueError, RuntimeError) as error:
-                    failed.append(origin)
-                    print(f"Will retry weather run for {origin}: {type(error).__name__}", flush=True)
-                if len(checkpoint) >= 25:
-                    _save_partitions(pd.concat(checkpoint, ignore_index=True), config)
-                    checkpoint.clear()
-                    print(
-                        f"Archived {completed_total}/{len(missing)} missing weather runs",
-                        flush=True,
-                    )
-        if checkpoint:
-            _save_partitions(pd.concat(checkpoint, ignore_index=True), config)
-            print(
-                f"Archived {completed_total}/{len(missing)} missing weather runs",
-                flush=True,
-            )
+        for batch_start in range(0, len(pending), 25):
+            batch = pending[batch_start : batch_start + 25]
+            checkpoint: list[pd.DataFrame] = []
+            rate_limited = False
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(fetch_weather_run, origin, config): origin for origin in batch
+                }
+                for future in as_completed(futures):
+                    origin = futures[future]
+                    try:
+                        checkpoint.append(future.result())
+                        completed_total += 1
+                    except WeatherRateLimitError:
+                        rate_limited = True
+                        failed.append(origin)
+                    except (requests.RequestException, ValueError, RuntimeError) as error:
+                        failed.append(origin)
+                        print(
+                            f"Will retry weather run for {origin}: {type(error).__name__}",
+                            flush=True,
+                        )
+            if checkpoint:
+                _save_partitions(pd.concat(checkpoint, ignore_index=True), config)
+                print(
+                    f"Archived {completed_total}/{len(missing)} missing weather runs",
+                    flush=True,
+                )
+            if rate_limited:
+                raise WeatherRateLimitError(
+                    "Open-Meteo rate limit reached. Completed runs were checkpointed; rerun later."
+                )
         if not failed:
             break
         pending = failed

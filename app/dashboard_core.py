@@ -45,7 +45,7 @@ def _run_backtest(
     history_origins: int,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if function is None:
-        return None, "The daily backtest is unavailable in the loaded inference module."
+        return None, "The hourly backtest is unavailable in the loaded inference module."
     try:
         return (
             function(
@@ -57,7 +57,7 @@ def _run_backtest(
             None,
         )
     except Exception as exc:
-        return None, f"The daily backtest could not be calculated: {exc}"
+        return None, f"The hourly backtest could not be calculated: {exc}"
 
 
 def _run_forecast(
@@ -91,7 +91,7 @@ def build_dashboard_results(
 ) -> DashboardResults:
     samples = _datetime_index(samples)
     if samples.empty:
-        raise ValueError("The daily forecast sample table is empty")
+        raise ValueError("The hourly forecast sample table is empty")
     missing = [column for column in artifact.feature_cols if column not in samples.columns]
     if missing:
         raise ValueError(f"The sample table is missing model inputs: {', '.join(missing[:5])}")
@@ -155,7 +155,7 @@ def build_dashboard_results(
         "horizon": artifact.horizon,
         "device": artifact.device,
         "nominal_coverage": artifact.forecast_config["nominal_coverage"],
-        "forecast_origin_hour_local": artifact.forecast_config["forecast_origin_hour_local"],
+        "forecast_frequency": artifact.forecast_config.get("forecast_frequency", "daily"),
         "timezone": artifact.forecast_config["timezone"],
         "latest_origin": samples.index[-1],
         "latest_weather_run": latest.get("weather_run_utc"),

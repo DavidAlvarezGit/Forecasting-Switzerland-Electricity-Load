@@ -128,22 +128,38 @@ def rolling_aci_intervals(
     evaluation_pred: np.ndarray,
     alpha: float,
     aci_config: ACIConfig,
+    *,
+    calibration_target_ends: pd.DatetimeIndex,
+    evaluation_origins: pd.DatetimeIndex,
+    evaluation_target_ends: pd.DatetimeIndex,
 ) -> dict[str, Any]:
     calibration = np.asarray(calibration_residuals, dtype=np.float64)
     true = np.asarray(evaluation_true, dtype=np.float64)
     pred = np.asarray(evaluation_pred, dtype=np.float64)
     if calibration.ndim != 2 or true.shape != pred.shape:
         raise ValueError("ACI expects 2D residual, truth, and prediction arrays")
+    calibration_ends = pd.DatetimeIndex(calibration_target_ends)
+    origins = pd.DatetimeIndex(evaluation_origins)
+    target_ends = pd.DatetimeIndex(evaluation_target_ends)
+    if len(calibration_ends) != len(calibration):
+        raise ValueError("Each calibration residual needs a target-end timestamp")
+    if len(origins) != len(true) or len(target_ends) != len(true):
+        raise ValueError("Each evaluated forecast needs origin and target-end timestamps")
+    if not origins.is_monotonic_increasing:
+        raise ValueError("ACI evaluation origins must be chronological")
     calibrator = AdaptiveConformalCalibrator(true.shape[1], alpha, aci_config)
-    for residual in calibration[-aci_config.window_size :]:
-        calibrator.update(residual)
+    pending: list[tuple[pd.Timestamp, np.ndarray]] = sorted(
+        zip(calibration_ends, calibration, strict=True), key=lambda event: event[0]
+    )
 
     widths: list[np.ndarray] = []
-    for row in range(len(true)):
+    for row, origin in enumerate(origins):
+        matured = [event for event in pending if event[0] <= origin]
+        pending = [event for event in pending if event[0] > origin]
+        for _, residual in matured:
+            calibrator.update(residual)
         widths.append(calibrator.widths())
-        # A daily forecast's final outcome is available at the next daily origin,
-        # so this residual can affect only subsequent rows.
-        calibrator.update(true[row] - pred[row])
+        pending.append((target_ends[row], true[row] - pred[row]))
     width_array = np.stack(widths)
     lower = pred - width_array
     upper = pred + width_array
@@ -168,14 +184,17 @@ def rolling_aci_intervals(
 def tune_aci_on_validation(
     validation_true: np.ndarray,
     validation_pred: np.ndarray,
+    validation_origins: pd.DatetimeIndex,
+    validation_target_ends: pd.DatetimeIndex,
     config: ForecastConfig = DEFAULT_CONFIG,
 ) -> tuple[ACIConfig, pd.DataFrame]:
     """Tune ACI only inside validation, leaving final-test outcomes untouched."""
     true = np.asarray(validation_true, dtype=np.float64)
     pred = np.asarray(validation_pred, dtype=np.float64)
-    if len(true) < 60:
-        raise ValueError("At least 60 validation origins are required to tune ACI")
-    initial_count = min(60, len(true) // 2)
+    minimum_initial = 60 * 24
+    if len(true) < minimum_initial * 2:
+        raise ValueError("At least 120 days of hourly validation origins are required to tune ACI")
+    initial_count = min(minimum_initial, len(true) // 2)
     residuals = true - pred
     rows: list[dict[str, Any]] = []
     alpha = 1.0 - config.nominal_coverage
@@ -189,6 +208,9 @@ def tune_aci_on_validation(
                     pred[initial_count:],
                     alpha,
                     candidate,
+                    calibration_target_ends=validation_target_ends[:initial_count],
+                    evaluation_origins=validation_origins[initial_count:],
+                    evaluation_target_ends=validation_target_ends[initial_count:],
                 )
                 rows.append(
                     {
